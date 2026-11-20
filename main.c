@@ -49,17 +49,15 @@
 // statement -> for, if
 // for -> "for" + id + "in" + "[" + (id + ",")* + "]" + "{" + for_body + "}"
 
-enum {
+enum AST_TYPE {
     AST_OBJECT,
     AST_LOOP,
     AST_IF,
-}
+};
 
-typedef struct AST {
-    union as {
-
-    }
-}
+typedef struct ast {
+    AST_TYPE type;
+} AST;
 
 int main() {
 
