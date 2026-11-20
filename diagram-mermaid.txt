@@ -1,0 +1,70 @@
+flowchart LR
+    %% Stochastic Inputs & Reagents
+    ORE_SRC(["Stochastic Ore Source<br/>(Bastnäsite / Monazite<br/>Basket Vector + Variance)"])
+    CHEM_SUP(["Chemical Supply<br/>(Acid, Water, Extractants<br/>with Delay Risk)"])
+    ADDITIVES(["Magnet Additives<br/>(Fe, B, Dy)"])
+
+    %% Stage 1: Ore Prep
+    subgraph Z1 ["1. Ore Concentration"]
+        PREP["Crushing, Flotation<br/>& Magnetic Sep."]
+        Q_CONC[("WIP: Mineral<br/>Concentrate<br/>(50–60% REO)")]
+    end
+
+    %% Stage 2: Acid Digestion
+    subgraph Z2 ["2. Acid Digestion"]
+        DIGEST["Rotary Kiln / Leaching<br/>(Batch Processor)"]
+        WASTE_TH(["Sink: Gangue &<br/>Thorium Waste"])
+        Q_PLS[("WIP: Pregnant Leach<br/>Solution (PLS)")]
+    end
+
+    %% Stage 3: Solvent Extraction Cascade
+    subgraph Z3 ["3. Solvent Extraction Cascade (Coupled Queue Network)"]
+        direction LR
+        S1["Stage 1<br/>(Mixer-Settler)"]
+        SMID["Stage k<br/>(Mixer-Settler)"]
+        SN["Stage N<br/>(Mixer-Settler)"]
+        RECYCLE_PURE["Off-Spec Recycle<br/>(Purity < Target)"]
+    end
+
+    %% Stage 4: Branching, Precipitation & Reduction
+    subgraph Z4 ["4. Branching, Precipitation & Reduction"]
+        SPLIT{"Stream Split<br/>(Unwanted vs. Target)"}
+        PREC_UNW["Oxalic Precip &<br/>Calcination (Ce/La)"]
+        STORE_UNW[("Sink / Warehouse:<br/>Unwanted Oxides<br/>(Accumulating Cost)")]
+
+        PREC_ND["Oxalic Precip &<br/>Calcination (Nd/Pr)"]
+        REDUCT["Electrolytic /<br/>Metallothermic Reduction<br/>(Batch Furnace)"]
+        Q_INGOT[("WIP: Nd Metal Ingots")]
+    end
+
+    %% Stage 5: Sintering & Magnet Line
+    subgraph Z5 ["5. NdFeB Magnet Sintering (Discrete Line)"]
+        CAST_MILL["Strip Casting, HD &<br/>Jet Milling"]
+        PRESS_SINT["Magnetic Pressing,<br/>Sintering & Finishing"]
+        MAG_OUT(["Finished NdFeB<br/>Magnets"])
+        SCRAP_LOOP["Grinding Swarf /<br/>Scrap Loop"]
+    end
+
+    %% Edges
+    ORE_SRC --> PREP --> Q_CONC --> DIGEST
+    CHEM_SUP -. "Reagent Deliv." .-> DIGEST
+    DIGEST --> WASTE_TH
+    DIGEST --> Q_PLS
+
+    %% Aqueous forward flow (i -> i+1) & Organic counter-flow (i+1 -> i)
+    Q_PLS -- "Aqueous In" --> S1
+    S1 -- "Aq (1->k)" --> SMID
+    SMID -- "Aq (k->N)" --> SN
+    SN -. "Org (N->k)" .-> SMID
+    SMID -. "Org (k->1)" .-> S1
+
+    SN -- "Target Stream" --> SPLIT
+    SN -. "Off-Spec" .-> RECYCLE_PURE -.-> Q_PLS
+
+    SPLIT -- "Low-Demand REEs<br/>(Ce, La, ...)" --> PREC_UNW --> STORE_UNW
+    SPLIT -- "Target REEs<br/>(Nd, Pr, ...)" --> PREC_ND --> REDUCT --> Q_INGOT
+
+    Q_INGOT --> CAST_MILL
+    ADDITIVES -. "Alloy Feed" .-> CAST_MILL
+    CAST_MILL --> PRESS_SINT --> MAG_OUT
+    PRESS_SINT -. "Scrap / Swarf" .-> SCRAP_LOOP -. "Reprocess" .-> Q_PLS
