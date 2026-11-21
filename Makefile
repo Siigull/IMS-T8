@@ -8,7 +8,7 @@
 #
 CXX      = clang++
 CXXFLAGS = -std=c++11 -O2 -Wall
-LIBDIR   = ../src
+LIBDIR   = ../simlib/src
 INCLUDE  = -I$(LIBDIR)
 LIBS     = -L$(LIBDIR) -lsimlib
 
