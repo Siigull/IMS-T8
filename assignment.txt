@@ -1,0 +1,9 @@
+T8: Zpracovatelský řetězec kovů vzácných zemin
+
+Studium. Hledejte pod hesly kovy vzácných zemin, bastnäsit, monazit, koncentrát, kyselý rozklad, kapalinová extrakce, protiproudá extrakční kaskáda, směšovací a usazovací jednotka, separace prvků, oxidy vzácných zemin, redukce na kov, slitina neodym-železo-bor, spékaný magnet. Tyto prvky jsou si navzájem tak podobné, že je jeden krok neoddělí; dělí se kaskádou stovek za sebou řazených stupňů, z nichž každý posune čistotu jen nepatrně, a materiál kaskádou putuje týdny. Ruda navíc dává celý koš prvků v poměru daném geologií, zatímco poptávka je soustředěna jen na několik z nich. Doba náběhu nového závodu se počítá v letech.
+
+Metoda řešení. Diskrétní model s modelovým časem, typu SHO. Obslužnými zdroji jsou rozkladné jednotky, jednotlivé stupně extrakční kaskády zapojené do série, redukční pece a zařízení na výrobu magnetů; mezi stupni vznikají zásoby rozpracovaného materiálu. Stavovými veličinami jsou složení a čistota proudu v jednotlivých stupních, velikost meziskladů a zásoby oddělených prvků. Náhodné prvky: kolísání složení vstupního koncentrátu, doby operací, poruchy stupňů, zpoždění dodávek procesních chemikálií.
+
+Experimenty. Změřte dobu průchodu materiálu celou kaskádou a ukažte, proč závod nelze rychle přizpůsobit změně poptávky. Vyřaďte jeden stupeň uprostřed kaskády a sledujte, jak se výpadek šíří oběma směry. Zvyšte požadavek na čistotu produktu a ukažte, kolik stupňů navíc je potřeba. Nechte závod běžet několik let a sledujte růst skladu prvků, o které není zájem; nakonec simulujte náběh závodu z nuly.
+
+Poznání. Proč separační kapacitu nelze postavit rychle ani po politickém rozhodnutí, doloženo dobou průchodu a dobou náběhu. Cena několika žádaných prvků musí uživit i zpracování těch, které nikdo nechce, protože z rudy vycházejí společně. Výstupem budiž vyhodnocení, jaká skladba poptávky by závod učinila ziskovým, a odhad doby od rozhodnutí k první dodávce.

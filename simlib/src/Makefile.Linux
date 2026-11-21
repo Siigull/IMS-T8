@@ -1,0 +1,22 @@
+#
+#  Makefile for SIMLIB
+#  ===================
+#
+
+# C++ compiler flags
+CXXFLAGS = -Wall -fPIC ### basic flags (always needed)
+CXXFLAGS += $(EXTRA_CXXFLAGS) ### external setting
+CXXFLAGS += -std=c++11
+CXXFLAGS += -O2
+CXXFLAGS += -g # with debug info
+CXXFLAGS += -Wextra # extra checks
+#CXXFLAGS += -Wshadow # test symbols TODO
+#CXXFLAGS += -pg # with profile support
+#CXXFLAGS += -Weffc++ # TODO extra checking
+#CXXFLAGS += -fprofile-arcs -ftest-coverage # tests
+
+DLL_SUFFIX = so
+CXXFLAG_DLL = -shared
+include Makefile.generic
+
+# end of Makefile
