@@ -221,26 +221,8 @@ class C_World {
 
 C_World g_w;
 
-constexpr int MAX_RING_BUFFER_SIZE = 100;
-
-typedef struct T_Ring_Buffer {
-    i64 buf[MAX_RING_BUFFER_SIZE];
-
-    i64 size       = MAX_RING_BUFFER_SIZE;
-    i64 read_head  = 0;
-    i64 write_head = 0;
-
-} T_Ring_Buffer;
-
-T_Ring_Buffer init_ring_buf(i64 size) {
-    T_Ring_Buffer t;
-    t.size = size;
-
-    return t;
-}
-
 // One aggregate material mass — "the blob". elem[e] is the contained REO
-// tonnage of element e; waste is the gangue. Ore tons = Σ elem + waste; head
+// tonnage of element e; waste is the rest. Ore tons = Σ elem + waste; head
 // grade is derivable: Σ elem / ore tons. No batch identity: a blob is a
 // blend of everything that entered it, like a real stockpile.
 typedef struct T_Mass {
@@ -271,6 +253,8 @@ enum E_Processor_State : u64 {
     S_FINISH,
 };
 
+
+// TODO(Sigull): Maybe I am just too sleep deprived but these wrods are too hard. 
 enum E_Truck_State : u64 {
     TRUCK_LOADING, // parked at the mine, waiting for a full load
     TRUCK_HAULING, // loaded, driving to the crusher. And unloading at crusher.
@@ -281,7 +265,6 @@ enum E_Truck_State : u64 {
 typedef struct T_Node {
     T_ID id;
     E_Node_Type type;
-    T_Ring_Buffer buf;
 
     T_ID input = -1;
     T_ID output = -1;
@@ -326,6 +309,7 @@ typedef struct T_Transaction {
     // T_MOVE
     T_Mass* mass_src;
     T_Mass* mass_dst;
+    T_Node* src;
     T_Node* dst;
     double amt;
 
@@ -361,12 +345,16 @@ T_Transaction* make_transaction(u64 type) {
     return t;
 }
 
-void trans_add_move(T_Transaction* t, T_Mass* mass_src, T_Mass* mass_dst, T_Node* dst, double amt) {
+void trans_add_move(T_Transaction* t, T_Mass* mass_src, T_Node* src, T_Mass* mass_dst, T_Node* dst, double amt) {
     debug_assert(t->type & T_MOVE, "Move 1");
+    assert(((size_t)mass_src - (size_t)src) < sizeof(T_Node), "add_move: src mass not in src");
+    assert(((size_t)mass_dst - (size_t)dst) < sizeof(T_Node), "add_move: dst mass not in dst");
 
     t->mass_src = mass_src;
     t->mass_dst = mass_dst;
+    t->src = src;
     t->dst = dst;
+
     t->amt = amt;
 
     debug_assert(((size_t)mass_dst - (size_t)dst) < sizeof(T_Node), "Move 2");
@@ -475,6 +463,7 @@ static b32 enact_transaction(T_ID id) {
     } else if(t->tick_var || t->timestamp) {
         debug_assert(false, "Uninitialized enact Tick");
     }
+
 
 
     // Kind of a hack. Wake up floation tank when move and tank is idle.
@@ -710,6 +699,7 @@ b32 send(T_ID id) {
 
     assert(n->output != -1, "Mistake in initing g_send_nodes.");
     T_Node* dst = get_node(n->output);
+    T_Node* src = get_node(n->input);
 
     switch(n->type) {
         case N_MINER:
@@ -719,28 +709,46 @@ b32 send(T_ID id) {
         {}break;
 
 
+        // Maybe better to have a multiway wake up model.
+        // NOTE(Sigull): Yep, can't keep my eyes open. See the mistakes,
+        //               but I just can't get a hold of them. It's like 
+        //               the thought immediately after it was seen falls
+        //               into a dark bottomless pit behind and trying to 
+        //               get it back is warping the space to throw the 
+        //               from the top back into the mind. And I can't meow.
         case N_TRUCK:
         {
-            if (n->truck_state != T_LOADING || n->next_tick != -1) return false;
-            T_Node* pad = get_node(n->input);
-            if (mass_tons(&pad->mass) < TRUCK_CAPACITY) return false;
-
-            mass_take(&n->mass, &pad->mass, TRUCK_CAPACITY);
-            n->truck_state = T_HAULING;
-            n->next_tick = g_w.time + TRUCK_DRIVE_TIME;
-            return true;
-
-            if (n->truck_state == TRUCK_HAULING) {
-                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
-                trans_add_move(t, &n->mass, &dst->mass, dst, mass_tons(&n->mass));
-                trans_add_truck_state(t, &n->truck_state, TRUCK_HAULED);
+            if (n->truck_state == TRUCK_HAULED) {
+                T_Transaction* t1 = make_transaction(T_MOVE | T_STATE);
+                trans_add_move(t1, &src->mass, src, &n->mass, n, TRUCK_CAPACITY);
+                trans_add_truck_state(t1, &n->truck_state, TRUCK_LOADING);
+                
+                Transaction* t2 = 
                 trans_add_tick(t, &n->next_tick, g_w.time + (5 * MIN));
 
+            } else if(n->truck_state == TRUCK_LOADED) {
+                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
+                trans_add_move(t, &n->mass, n, &dst->mass, dst, mass_tons(&n->mass));
+                trans_add_truck_state(t, &n->truck_state, TRUCK_HAULING);
+
+                trans_add_tick(t, &n->next_tick, g_w.time + (5 * MIN));
+
+            } else if(n->truck_state == TRUCK_HAULING) {
+                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
+                trans_add_move(t, &n->mass, n, &dst->mass, dst, mass_tons(&n->mass));
+                trans_add_truck_state(t, &n->truck_state, TRUCK_HAULED);
+
+                trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
+
+            } else if(n->truck_state == TRUCK_LOADING) {
+                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
+                trans_add_move(t, &src->mass, src, &n->mass, n, TRUCK_CAPACITY);
+                trans_add_truck_state(t, &n->truck_state, TRUCK_LOADED);
+
+                trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
+
             } else {
-                // Back at the mine, empty. Loading happens in the pull sweep.
-                n->truck_state = TRUCK_LOADING;
-                n->next_tick = -1;
-                return true;
+                assert(false, "Unknown truck state");
             }
         } break;
 
@@ -751,13 +759,12 @@ b32 send(T_ID id) {
             i64 read_head  = n->belt_head % n->belt_size;
             T_Transaction* t1;
             t1 = make_transaction(T_MOVE);
-            trans_add_move(t1, &n->belt[read_head], &dst->mass, dst, mass_tons(&n->belt[read_head]));
+            trans_add_move(t1, &n->belt[read_head], n, &dst->mass, dst, mass_tons(&n->belt[read_head]));
 
             // Receiving
-            T_Node* src = get_node(n->input);
             i64 write_head = (n->belt_head - 1) % n->belt_size;
             T_Transaction* t2 = make_transaction(T_MOVE);
-            trans_add_move(t2, &src->out, &n->belt[write_head], n, BELT_CELL_CAP);
+            trans_add_move(t2, &src->out, src, &n->belt[write_head], n, BELT_CELL_CAP);
 
             // Increment head
             T_Transaction* t3 = make_transaction(T_HEAD_INCREMENT);
@@ -775,10 +782,6 @@ b32 send(T_ID id) {
     }
 
     return true;
-}
-
-static void schedule_tick(T_ID id) {
-    T_Node* n = get_node(id);
 }
 
 int main(void) {
@@ -837,10 +840,6 @@ int main(void) {
                 // TODO(Sigull): When finished program check if precedence really isn't necessary.
                 // Maybe do it, by resending more again.
                 changed |= enact_transaction(i); // If all remaining transactions don't do shit, break.
-        }
-
-        for (int i=0; i<g_node_count; i++) {
-            schedule_tick(i);
         }
 
         // 3) periodic report
