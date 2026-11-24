@@ -3,14 +3,19 @@
     #### Real world simulation match ####
 */
 
+// TODO(Sigull): Can there be two transactions which depend on each other.
+// Is that even an issue?
+
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <random>
 #include <iostream>
 #include <algorithm>
+#include <cstring>
 
 #define i64 int64_t
+#define u64 uint64_t
 #define b32 int32_t
 
 #define T_ID int64_t
@@ -124,14 +129,19 @@ constexpr int    ADDITIVE_ELEM         = N_ELEMS - 1; // Dy
 // Ground simulation params.
 constexpr i64 SEED  = 'm' + 'e' + 'o' + 'w';
 
-[[noreturn]] void assert_fail(const char* why) {
-    std::cerr << "[Assert]: " << why;
-    exit(1);
+void assert(bool cond, const char* why) {
+    if(!cond) {
+        std::cout << "[Assert]: " << why;
+        exit(1);
+    }
 }
 
-// Macro (not function) so the optimizer can prune the impossible path after a
-// failed check — keeps -Warray-bounds quiet.
-#define assert(cond, why) ((cond) ? (void)0 : assert_fail(why))
+void debug_assert(bool cond, const char* why) {
+    if(!cond) {
+        std::cout << "[Assert]: " << why;
+        exit(1);
+    }
+}
 
 // Standard normal CDF: Phi(x) = 0.5 * (1 + erf(x / sqrt(2))).
 static double normal_cdf(double x) {
@@ -227,46 +237,171 @@ static double mass_tons(const T_Mass* m) {
     return t;
 }
 
-// Move the whole blob src into dst (src ends empty).
-static void mass_move(T_Mass* dst, T_Mass* src) {
-    for (int el = 0; el < N_ELEMS; el++) {
-        dst->elem[el] += src->elem[el];
-        src->elem[el] = 0;
-    }
-    dst->waste += src->waste;
-    src->waste = 0;
-}
-
-// Pull up to `want` tons out of src, proportionally (blend-preserving),
-// into dst. Takes less when src holds less.
-static void mass_take(T_Mass* dst, T_Mass* src, double want) {
-    double total = mass_tons(src);
-    if (total <= 0.0) return;
-    if (want > total) want = total;
-    double f = want / total;
-    for (int el = 0; el < N_ELEMS; el++) {
-        dst->elem[el] += src->elem[el] * f;
-        src->elem[el] *= (1.0 - f);
-    }
-    dst->waste += src->waste * f;
-    src->waste *= (1.0 - f);
-}
-
-enum E_Node_Type {
-    E_MINER,
-    E_TRANSFER,     // Can also split based on rules.
-    E_ADDITIVE_SRC, // imported additives (e.g. Dy oxide) — pools into g_additives
-    E_TRUCK,
-    E_CRUSHER,
-    E_CONVEYOR,
-    E_FLOTATION,
-    E_TAILINGS,     // passive sink: the dam (never scheduled)
+enum E_Transaction_Type : u64 {
+    T_MOVE = 1 << 0,
+    T_VAR = 1 << 1,
+    T_STATE = 1 << 2,
+    T_TICK = 1 << 3, // Probably something with event planning.
 };
 
-enum E_Truck_State {
-    T_LOADING,   // parked at the mine, waiting for a full load
-    T_HAULING,   // loaded, driving to the crusher
-    T_RETURNING, // empty, driving back to the mine
+// All have to succeed to accept transaction.
+typedef struct T_Transaction {
+    u64 type; // FLAGS
+    b32 not_done = true; // Don't do transaction twice.
+
+    // T_MOVE
+    T_Mass* mass_src;
+    T_Mass* mass_dst;
+    T_Node* dst;
+    double amt;
+
+    // T_VAR
+    i64* var;
+    i64 new_var;
+
+    // T_STATE
+    E_Truck_State* state_var;
+    E_Truck_State new_state;
+
+    // T_TICK
+    i64* tick_var;
+    i64 timestamp;
+
+} T_Transaction;
+
+constexpr int MAX_TRANSACTIONS = 100;
+T_Transaction g_transactions[MAX_TRANSACTIONS];
+i64 g_transaction_count = 0;
+
+T_Transaction* make_transaction(u64 type) {
+    assert(g_transaction_count < MAX_TRANSACTIONS, "Increase transaction capacity.");
+    
+    T_Transaction* t = &g_transactions[g_transaction_count++];
+    std::memset(t, 0, sizeof(T_Transaction));
+    
+    t->type = type; 
+
+    return t;
+}
+
+void trans_add_move(T_Transaction* t, T_Mass* mass_src, T_Mass* mass_dst, T_Node* dst, double amt) {
+    debug_assert(t->type & T_MOVE, "Move 1");
+
+    t->mass_src = mass_src;
+    t->mass_dst = mass_dst;
+    t->dst = dst;
+    t->amt = amt;
+
+    debug_assert(((size_t)mass_dst - (size_t)dst) < sizeof(T_Node), "Move 2");
+}
+
+void trans_add_var(T_Transaction* t, i64* var, i64 val) {
+    debug_assert(t->type & T_VAR, "Var 1");
+
+    t->var = var;
+    t->new_var = val;
+}
+
+void trans_add_truck_state(T_Transaction* t, E_Truck_State* state_var, E_Truck_State new_state) {
+    debug_assert(t->type & T_STATE, "State 1");
+
+    t->state_var = state_var;
+    t->new_state = new_state;
+}
+
+void trans_add_tick(T_Transaction* t, i64* tick_var, i64 timestamp) {
+    debug_assert(timestamp > g_w.time, "Tick 1");
+
+    t->tick_var = tick_var;
+    t->timestamp = timestamp;
+}
+
+static void clear_transactions() {
+    g_transaction_count = 0;
+}
+
+// !! have to be careful !!
+// IF ANY PART OF A TRANSACTION FAILS, THE WHOLE THING FAILS
+static b32 enact_transaction(T_ID id) {
+    assert(id < g_transaction_count, "Transaction id out of bounds.");
+    T_Transaction* t = &g_transactions[id];
+    if(!t->not_done) return false;
+
+    // Move some materials from one processor to another.
+    if(t->type & T_MOVE) {
+        T_Mass* dst = t->mass_dst;
+        T_Mass* src = t->mass_src;
+        T_Node* dst_node = t->dst;
+        double want_amt = t->amt;
+
+        double from_total = mass_tons(src);
+        double to_total = mass_tons(dst);
+        double to_space_left = to_total - dst_node->mass_capacity;
+
+        // Don't do transaction at all
+        if (to_space_left <= 0.0) return false;
+        if (from_total <= 0.0) return false;
+
+        if (want_amt > to_space_left) want_amt = to_space_left;
+        if (want_amt > from_total)    want_amt = from_total;
+
+        double from_frac = want_amt / from_total;
+        double to_frac   = want_amt / to_total;
+        for (int el = 0; el < N_ELEMS; el++) {
+            dst->elem[el] += dst->elem[el] * to_frac;
+            src->elem[el] += src->elem[el] * from_frac;
+        }
+        dst->waste += dst->waste * to_frac;
+        src->waste += src->waste * from_frac;
+
+    } else if(t->mass_dst || t->mass_src || t->dst || t->amt) {
+        debug_assert(false, "Enact Move");
+    }
+
+    // Change variable value. 
+    // (Might be outdated, now only for conveyor->head++)
+    if(t->type & T_VAR) {
+        *t->var = t->new_var;
+
+    } else if(t->var || t->new_var) {
+        debug_assert(false, "Enact Var");
+    }
+
+    // Change truck state.
+    if(t->type & T_STATE) {
+        *t->state_var = t->new_state;
+
+    } else if(t->state_var || t->new_state) {
+        debug_assert(false, "Enact State");
+    }
+
+    // Set next tick to a timestamp.
+    if(t->type & T_TICK) {
+        *t->tick_var = t->timestamp;
+
+    } else if(t->tick_var || t->timestamp) {
+        debug_assert(false, "Enact Tick");
+    }
+
+    t->not_done = false;
+    return true;
+}
+
+enum E_Node_Type : u64 {
+    N_MINER,
+    N_TRANSFER,     // Can also split based on rules.
+    N_ADDITIVE_SRC, // imported additives (e.g. Dy oxide) — pools into g_additives
+    N_TRUCK,
+    N_CRUSHER,
+    N_CONVEYOR,
+    N_FLOTATION,
+    N_TAILINGS,     // passive sink: the dam (never scheduled)
+};
+
+enum E_Truck_State : u64 {
+    TRUCK_LOADING,   // parked at the mine, waiting for a full load
+    TRUCK_HAULING,   // loaded, driving to the crusher
+    TRUCK_RETURNING, // empty, driving back to the mine
 };
 
 typedef struct T_Node {
@@ -277,17 +412,17 @@ typedef struct T_Node {
     T_ID input = -1;
     T_ID output = -1;
 
-    i64 done_at = -1; // next scheduled event; -1 = idle
+    i64 next_tick = -1; // next scheduled event; -1 = idle
 
     // Owned stock: feed-side holdup, material in processing, product side.
-    T_Mass mass_unchecked;
-    b32 is_mass_unchecked = false;
     T_Mass mass;
     T_Mass wip;
     T_Mass out;
 
+    i64 mass_capacity = INT64_MAX;
+
     // E_TRUCK
-    int truck_state = T_LOADING;
+    E_Truck_State truck_state = TRUCK_LOADING;
 
     // E_CONVEYOR
     T_Mass belt[BELT_CELLS];
@@ -313,9 +448,8 @@ int g_receive_node_count = 0;
 T_Mass g_additives;
 
 T_Node* init_node(E_Node_Type type, i64 buf_size) {
-    // direct if (not the assert macro): GCC's -Warray-bounds only prunes the
-    // out-of-bounds path when the guard is a plain statement in this function.
-    if (g_node_count >= MAX_NODE_COUNT) assert_fail("Too many nodes. Increase MAX_NODE_COUNT.");
+    assert(g_node_count < MAX_NODE_COUNT, "Too many nodes. Increase MAX_NODE_COUNT.");
+
     T_Node* n = &g_nodes[g_node_count];
     n->id = g_node_count++;
     n->type = type;
@@ -325,7 +459,7 @@ T_Node* init_node(E_Node_Type type, i64 buf_size) {
 }
 
 T_Node* init_transfer_node(i64 length) {
-    T_Node* n = init_node(E_TRANSFER, 0);
+    T_Node* n = init_node(N_TRANSFER, 0);
     n->transfer_length = length;
 
     return n;
@@ -349,19 +483,23 @@ void link_nodes(T_ID from, T_ID to) {
     to_n->input    = from_n->id;
 }
 
+void tick(T_ID id) {
+    T_Node* n = &g_nodes[id];
+    if (n->next_tick != g_w.time) return;
+
+}
+
 // Fired when a node's scheduled event comes due.
 b32 send(T_ID id) {
     assert(id < g_node_count && id >= 0, "Code problem. Send ID out of range.");
     T_Node* n = &g_nodes[id];
-
-    if(n->done_at != g_w.time) return;
 
     assert(n->output != -1, "Mistake in initing g_send_nodes.");
     T_Node* dst = &g_nodes[n->output];
     // T_Node* src = &g_nodes[n->input];
 
     switch(n->type) {
-        case E_MINER:
+        case N_MINER:
         {
             // Grade of received ore. Changes over time.
             static double grade_state = GRADE_MEAN;
@@ -385,79 +523,75 @@ b32 send(T_ID id) {
             double stock = mass_tons(&n->mass);
             double speed = std::clamp(STOCK_TARGET / stock, MINE_SPEED_MIN, MINE_SPEED_MAX);
 
-            n->done_at = g_w.time + g_w.exponential(ARRIVAL_MEAN / speed);
+            n->next_tick = g_w.time + g_w.exponential(ARRIVAL_MEAN / speed);
         } break;
 
 
-        case E_TRANSFER:
+        case N_TRANSFER:
         {
             assert(n->input != -1, "Transfer has no input.");
-            n->done_at = g_w.time + n->transfer_length;
+            n->next_tick = g_w.time + n->transfer_length;
         } break;
 
 
-        case E_ADDITIVE_SRC:
+        case N_ADDITIVE_SRC:
         {
-            // imported additive delivery on memoryless shipping gaps — pools
-            // into its own blob; nothing in the ore chain consumes it yet
             g_additives.elem[ADDITIVE_ELEM] += ADDITIVE_LOT_TONS;
-            n->done_at = g_w.time + g_w.exponential(ADDITIVE_ARRIVAL_MEAN);
+            n->next_tick = g_w.time + g_w.exponential(ADDITIVE_ARRIVAL_MEAN);
         } break;
 
 
-        case E_TRUCK:
+        case N_TRUCK:
         {
-            if (n->truck_state == T_HAULING) {
+            if (n->truck_state == TRUCK_HAULING) {
                 // Arrived at the crusher: dump the cargo into its feed stock.
                 // (A real dump pocket can refuse when full — the truck then
                 // waits parked right next to the crusher. That refusal needs a
                 // stock capacity, which does not exist yet, so for now the
                 // dump always succeeds.)
-                mass_move(&g_nodes[n->output].mass, &n->mass, &dst->is_mass_unchecked);
-                n->truck_state = T_RETURNING;
+                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
+                trans_add_move(t, &n->mass, &dst->mass, dst, mass_tons(&n->mass));
+                trans_add_truck_state(t, &n->truck_state, TRUCK_RETURNING);
+                // trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
+
             } else {
                 // Back at the mine, empty. Loading happens in the pull sweep.
-                n->truck_state = T_LOADING;
-                n->done_at = -1;
+                n->truck_state = TRUCK_LOADING;
+                n->next_tick = -1;
                 return true;
             }
-            n->done_at = g_w.time + TRUCK_DRIVE_TIME;
         } break;
 
 
-        case E_CRUSHER:
+        case N_CRUSHER:
         {
             // Run done: crushed product moves to the out-stock the belt
             // meters from. The sweep starts the next run if stock remains.
-            mass_move(&n->out, &n->wip);
-            n->done_at = -1;
+            T_Transaction* t = make_transaction(T_MOVE);
+            trans_add_move(t, &n->out, &dst->belt[n->belt_head], dst, mass_tons(&n->out));
         } break;
 
 
-        case E_CONVEYOR:
+        case N_CONVEYOR:
         {
             i64 head = n->belt_head / n->belt_size;
 
-            mass_move(&dst->mass, &n->belt[head]);
+            T_Transaction* t;
+            if(mass_tons(&n->belt[head]) > 0.0) {
+                t = make_transaction(T_MOVE | T_VAR);
+                trans_add_move(t, &n->belt[head], dst->mass, dst, mass_tons(&n->belt[head]));
+                trans_add_var(t, &n->belt_head, n->belt_head + 1);
+            
+            } else {
+                t = make_transaction(T_VAR);
+                trans_add_var(t, &n->belt_head, n->belt_head + 1);
+            } 
 
-            // double level = 0;
-            // for (int i = 0; i < BELT_CELLS; i++) level += mass_tons(&n->belt[i]);
-            // double want = std::min(BELT_CELL_CAP, BELT_CAPACITY - level);
-            // mass_take(&n->belt[head], &src->out, BELT_CELL_CAP);
-
-            // 4) priming: full belt starts flowing; fully drained belt stops
-            // level = 0;
-            // for (int i = 0; i < BELT_CELLS; i++) level += mass_tons(&n->belt[i]);
-            // if (level >= BELT_CAPACITY - 1e-9) n->belt_primed = true;
-            // if (level <= 1e-9) n->belt_primed = false;
-
-            // stay scheduled while there is anything to move, else go idle
-            // (the pull sweep wakes the belt when product appears upstream)
-            n->done_at = g_w.time + BELT_TICK;
+            n->next_tick = g_w.time + BELT_TICK;
         } break;
 
 
-        case E_FLOTATION:
+        case N_FLOTATION:
         {
             // Campaign done: apply the mass map to the campaign feed (wip).
             // Same algebra as ever, just per campaign slice at its own pace:
@@ -483,7 +617,7 @@ b32 send(T_ID id) {
             n->wip.waste = gangue_to_conc;
 
             mass_move(&n->out, &n->wip);
-            n->done_at = -1;
+            n->next_tick = -1;
         } break;
 
 
@@ -505,34 +639,34 @@ static b32 pull(T_ID id) {
     T_Node* dst = &g_nodes[n->output];
 
     switch (n->type) {
-        case E_TRUCK:
+        case N_TRUCK:
         {
             // Wait-for-full: depart only when the pad can fill the truck.
-            if (n->truck_state != T_LOADING || n->done_at != -1) return false;
+            if (n->truck_state != T_LOADING || n->next_tick != -1) return false;
             T_Node* pad = &g_nodes[n->input];
             if (mass_tons(&pad->mass) < TRUCK_CAPACITY) return false;
 
             mass_take(&n->mass, &pad->mass, TRUCK_CAPACITY);
             n->truck_state = T_HAULING;
-            n->done_at = g_w.time + TRUCK_DRIVE_TIME;
+            n->next_tick = g_w.time + TRUCK_DRIVE_TIME;
             return true;
         }
 
-        case E_CRUSHER:
+        case N_CRUSHER:
         {
-            if (n->done_at != -1) return false;
+            if (n->next_tick != -1) return false;
             double tons = mass_tons(&n->mass);
             if (tons <= 0.0) return false;
 
             double rate = g_w.uniform(CRUSHER_MIN_RATE, CRUSHER_MAX_RATE);
             mass_take(&n->wip, &n->mass, tons); // campaign eats all stocked feed
-            n->done_at = g_w.time + (i64)std::llround(tons / rate * HOUR);
+            n->next_tick = g_w.time + (i64)std::llround(tons / rate * HOUR);
             return true;
         }
 
-        case E_FLOTATION:
+        case N_FLOTATION:
         {
-            if (n->done_at != -1) return false;
+            if (n->next_tick != -1) return false;
             double tons = mass_tons(&n->mass);
             if (tons <= 0.0) return false;
 
@@ -540,11 +674,11 @@ static b32 pull(T_ID id) {
                                         FLOTATION_MID_CAPACITY,
                                         FLOTATION_MAX_CAPACITY);
             mass_take(&n->wip, &n->mass, tons); // campaign eats all stocked feed
-            n->done_at = g_w.time + (i64)std::llround(tons / cap * HOUR);
+            n->next_tick = g_w.time + (i64)std::llround(tons / cap * HOUR);
             return true;
         }
 
-        case E_CONVEYOR:
+        case N_CONVEYOR:
         {
             T_Node* src = &g_nodes[n->input];
 
@@ -555,7 +689,7 @@ static b32 pull(T_ID id) {
             n->belt[head] = n->mass_unchecked;
             n->mass_unchecked = T_Mass();
 
-            n->done_at = g_w.time + BELT_TICK;
+            n->next_tick = g_w.time + BELT_TICK;
             return true;
         }
 
@@ -564,21 +698,18 @@ static b32 pull(T_ID id) {
     }
 }
 
-static b32 clear(T_ID id) {
+static void schedule_tick(T_ID id) {
     T_Node* n = &g_nodes[id];
-
-    n->mass_unchecked = T_Mass();
-    n->is_mass_unchecked = false;
 }
 
 int main(void) {
     //      miner ──truck──> crusher ──belt──> flotation ──rejects──> dam
-    T_Node* miner   = init_node(E_MINER, 0);
-    T_Node* truck   = init_node(E_TRUCK, 0);
-    T_Node* crusher = init_node(E_CRUSHER, 0);
-    T_Node* belt    = init_node(E_CONVEYOR, 0);
-    T_Node* flot    = init_node(E_FLOTATION, 0);
-    T_Node* dam     = init_node(E_TAILINGS, 0);
+    T_Node* miner   = init_node(N_MINER, 0);
+    T_Node* truck   = init_node(N_TRUCK, 0);
+    T_Node* crusher = init_node(N_CRUSHER, 0);
+    T_Node* belt    = init_node(N_CONVEYOR, 0);
+    T_Node* flot    = init_node(N_FLOTATION, 0);
+    T_Node* dam     = init_node(N_TAILINGS, 0);
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
 
@@ -589,17 +720,19 @@ int main(void) {
     link_nodes(flot->id,    dam->id); // reject stream; product waits in flot->out
 
     // Prime the only exogenous clock; everything else wakes via the sweep.
-    miner->done_at = (i64)g_w.exponential(ARRIVAL_MEAN);
+    miner->next_tick = (i64)g_w.exponential(ARRIVAL_MEAN);
 
     i64 next_report = 30 * DAY;
     while (g_w.time < g_w.END) {
+        clear_transactions();
+
         // 1) advance to the earliest due event
         int next = -1;
         i64 best = 0;
         for (int i = 0; i < g_node_count; i++) {
-            if (g_nodes[i].done_at == -1) continue;
-            if (next == -1 || g_nodes[i].done_at < best) {
-                best = g_nodes[i].done_at;
+            if (g_nodes[i].next_tick == -1) continue;
+            if (next == -1 || g_nodes[i].next_tick < best) {
+                best = g_nodes[i].next_tick;
                 next = i;
             }
         }
@@ -610,6 +743,10 @@ int main(void) {
         }
 
         g_w.time = best;
+        for (int i=0; i<g_node_count; i++) {
+            tick(i);
+        }
+
         for (int i=0; i<g_send_node_count; i++) {
             send(g_send_nodes[i]);
         }
@@ -617,12 +754,14 @@ int main(void) {
         b32 changed = true;
         while (changed) {
             changed = false;
-            for (int i = 0; i < g_receive_node_count; i++)
-                if (pull(g_receive_nodes[i])) changed = true;
+            for (int i = 0; i < g_transaction_count; i++)
+                // TODO(Sigull): When finished program check if precedence really isn't necessary.
+                // Maybe do it, by resending more again.
+                changed |= enact_transaction(i); // If all remaining transactions don't do shit.
         }
 
-        for (int i = 0; i < g_node_count; i++) {
-            clear(i);
+        for (int i=0; i<g_node_count; i++) {
+            schedule_tick(i);
         }
 
         // 3) periodic report
