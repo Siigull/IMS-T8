@@ -237,6 +237,53 @@ static double mass_tons(const T_Mass* m) {
     return t;
 }
 
+enum E_Node_Type : u64 {
+    N_MINER,
+    N_TRANSFER,     // Can also split based on rules.
+    N_ADDITIVE_SRC, // imported additives (e.g. Dy oxide) — pools into g_additives
+    N_TRUCK,
+    N_CRUSHER,
+    N_CONVEYOR,
+    N_FLOTATION,
+    N_TAILINGS,     // passive sink: the dam (never scheduled)
+};
+
+enum E_Truck_State : u64 {
+    TRUCK_LOADING,   // parked at the mine, waiting for a full load
+    TRUCK_HAULING,   // loaded, driving to the crusher
+    TRUCK_RETURNING, // empty, driving back to the mine
+};
+
+typedef struct T_Node {
+    T_ID id;
+    E_Node_Type type;
+    T_Ring_Buffer buf;
+
+    T_ID input = -1;
+    T_ID output = -1;
+
+    i64 next_tick = -1; // next scheduled event; -1 = idle
+
+    // Owned stock: feed-side holdup, material in processing, product side.
+    T_Mass mass;
+    T_Mass wip;
+    T_Mass out;
+
+    i64 mass_capacity = INT64_MAX;
+
+    // E_TRUCK
+    E_Truck_State truck_state = TRUCK_LOADING;
+
+    // E_CONVEYOR
+    T_Mass belt[BELT_CELLS];
+    i64 belt_size = BELT_CELLS;
+    i64 belt_head = 0;
+
+    // E_TRANSFER
+    i64 transfer_length = 0;
+
+} T_Node;
+
 enum E_Transaction_Type : u64 {
     T_MOVE = 1 << 0,
     T_VAR = 1 << 1,
@@ -279,7 +326,8 @@ T_Transaction* make_transaction(u64 type) {
     T_Transaction* t = &g_transactions[g_transaction_count++];
     std::memset(t, 0, sizeof(T_Transaction));
     
-    t->type = type; 
+    t->type = type;
+    t->not_done = true;
 
     return t;
 }
@@ -336,7 +384,7 @@ static b32 enact_transaction(T_ID id) {
 
         double from_total = mass_tons(src);
         double to_total = mass_tons(dst);
-        double to_space_left = to_total - dst_node->mass_capacity;
+        double to_space_left = dst_node->mass_capacity - to_total;
 
         // Don't do transaction at all
         if (to_space_left <= 0.0) return false;
@@ -349,10 +397,10 @@ static b32 enact_transaction(T_ID id) {
         double to_frac   = want_amt / to_total;
         for (int el = 0; el < N_ELEMS; el++) {
             dst->elem[el] += dst->elem[el] * to_frac;
-            src->elem[el] += src->elem[el] * from_frac;
+            src->elem[el] -= src->elem[el] * from_frac;
         }
         dst->waste += dst->waste * to_frac;
-        src->waste += src->waste * from_frac;
+        src->waste -= src->waste * from_frac;
 
     } else if(t->mass_dst || t->mass_src || t->dst || t->amt) {
         debug_assert(false, "Enact Move");
@@ -386,53 +434,6 @@ static b32 enact_transaction(T_ID id) {
     t->not_done = false;
     return true;
 }
-
-enum E_Node_Type : u64 {
-    N_MINER,
-    N_TRANSFER,     // Can also split based on rules.
-    N_ADDITIVE_SRC, // imported additives (e.g. Dy oxide) — pools into g_additives
-    N_TRUCK,
-    N_CRUSHER,
-    N_CONVEYOR,
-    N_FLOTATION,
-    N_TAILINGS,     // passive sink: the dam (never scheduled)
-};
-
-enum E_Truck_State : u64 {
-    TRUCK_LOADING,   // parked at the mine, waiting for a full load
-    TRUCK_HAULING,   // loaded, driving to the crusher
-    TRUCK_RETURNING, // empty, driving back to the mine
-};
-
-typedef struct T_Node {
-    T_ID id;
-    E_Node_Type type;
-    T_Ring_Buffer buf;
-
-    T_ID input = -1;
-    T_ID output = -1;
-
-    i64 next_tick = -1; // next scheduled event; -1 = idle
-
-    // Owned stock: feed-side holdup, material in processing, product side.
-    T_Mass mass;
-    T_Mass wip;
-    T_Mass out;
-
-    i64 mass_capacity = INT64_MAX;
-
-    // E_TRUCK
-    E_Truck_State truck_state = TRUCK_LOADING;
-
-    // E_CONVEYOR
-    T_Mass belt[BELT_CELLS];
-    i64 belt_size = BELT_CELLS;
-    i64 belt_head = 0;
-
-    // E_TRANSFER
-    i64 transfer_length = 0;
-
-} T_Node;
 
 constexpr int MAX_NODE_COUNT = 100;
 T_Node g_nodes[MAX_NODE_COUNT];
@@ -472,9 +473,9 @@ void link_nodes(T_ID from, T_ID to) {
     g_send_nodes[g_send_node_count++] = from;
 
     for(int i=0; i<g_receive_node_count; i++) {
-        assert(g_receive_nodes[i] != from, "Receive from only one node for now.");
+        assert(g_receive_nodes[i] != to, "Receive from only one node for now.");
     }
-    g_receive_nodes[g_receive_node_count++] = from;
+    g_receive_nodes[g_receive_node_count++] = to;
 
     T_Node* from_n = &g_nodes[from];
     T_Node* to_n   = &g_nodes[to];
@@ -574,7 +575,7 @@ b32 send(T_ID id) {
 
         case N_CONVEYOR:
         {
-            i64 head = n->belt_head / n->belt_size;
+            i64 head = n->belt_head % n->belt_size;
 
             T_Transaction* t;
             if(mass_tons(&n->belt[head]) > 0.0) {
