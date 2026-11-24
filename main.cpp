@@ -1,290 +1,370 @@
-// main.cpp — simulation loop + Zone 1 (ore extraction).
-//
-// The plant is a graph held in two arrays: nodes[] (the processors) and
-// edges[] (the connections between them, which say where material goes).
-// Every node has an input buffer: a ring buffer holding up to `cap` batches.
-// Moving material takes no time on an edge: anything that takes time,
-// transport included, is a node. So every batch is always either waiting
-// in a node's input buffer or being worked on inside a node.
-//
-// A node takes the oldest batch from its input buffer, works on it, and
-// pushes it into the input buffer of the emptiest node it has an edge to.
-// If every one of those is full, the finished batch stays inside and the
-// node is blocked; that spreads back up the chain, all the way to the mine.
-// A mine makes its own batches; at a digest node batches leave the plant.
-//
-// Time is whole milliseconds. At each moment every node gets a turn, in
-// array order, until a full round changes nothing. Then the clock jumps to
-// the next moment someone needs it.
-//
-// A batch holds its total tons and the tons of each element's oxide (REO -
-// rare earths oxide).
-// Flotation is the only place that changes them: each element keeps the
-// fraction r, the rest is tailings, and the batch becomes concentrate.
+/*
+    #####################################
+    #### Real world simulation match ####
+*/
 
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <iostream>
+#include <algorithm>
 
 #define i64 int64_t
+#define b32 int32_t
 
-constexpr i64 MS   = 1;
-constexpr i64 SEC  = 1000 * MS;
-constexpr i64 MIN  = 60 * SEC;
-constexpr i64 HOUR = 60 * MIN;
-constexpr i64 DAY  = 24 * HOUR;
+#define T_ID int64_t
 
-// --- run settings; each machine's own parameters live in its case in step() ---
-constexpr i64 T_END    = 90 * DAY;
-constexpr i64 SEED     = 42;
-constexpr i64 TURN_CAP = 1000; // same-moment turns before we call it a bug
+// Base simulation time is in milliseconds.
+constexpr i64 MS   =          1;
+constexpr i64 SEC  =      1'000;
+constexpr i64 MIN  =     60'000;
+constexpr i64 HOUR =  3'600'000;
+constexpr i64 DAY  = 86'400'000;
 
-constexpr int N = 5; // elements: La, Ce, Pr, Nd, Dy
-constexpr int QMAX = 32; // ring buffer slots; a node's cap can't be larger
+// ###################################################################
+// Miner params — realistic setup, rationale in zone1-ore-extraction.md §3.2–§3.4.
+//
+// - Exp arrivals: uncoordinated external supply, memoryless gaps.
+//
+// - U(80,120) t: truckload mass, simplest bounded draw.
+//
+// - Grade: AR(1) drift around the deposit mean — real mines feed from
+//   different faces over days, so grade wanders slowly (corr. time ~5 d)
+//   instead of jumping per batch. Bounds are a physical guarantee (±6σ,
+//   essentially never bind).
+//
+// - Basket: hardcoded deposit constant — the real bastnäsite pattern
+//   (Ce>La>Nd≫Pr, Dy trace), fixed by the mineral lattice, so no per-batch
+//   draw. Concentration preserves the basket: every ton of Nd drags
+//   ~4.2 t Ce + ~2.8 t La through the plant.
+//
+// - Stock feedback: the mine throttles against its own stockpile (the blob
+//   it feeds). Pad near target → nominal pace; pad full → slow down;
+//   pad dry → catch up. speed = clamp(TARGET / stock, MIN, MAX).
+//
+// - Dy is NOT in the ore (real bastnäsite carries <0.1 %). It arrives as
+//   imported Dy oxide lots into its own blob (g_additives), outside the ore
+//   chain until a consumer exists.
+constexpr double TONS_IN_BASKET_MIN = 80;
+constexpr double TONS_IN_BASKET_MAX = 120;
+constexpr double ARRIVAL_MEAN = 10.0 * HOUR; // time to dig one batch
 
-struct Batch {
-    double tons;
-    double reo[N];   // tons of each element's oxide
-};
+// Feed grade AR(1): g_{k+1} = MEAN + PHI·(g_k − MEAN) + ε, ε ~ N(0, INNOV).
+// PHI = 0.92 per ~10 h batch ⇒ correlation time ≈ 5 days; stationary sd 0.005.
+constexpr double GRADE_MEAN          = 0.08;
+constexpr double GRADE_STATIONARY_SD = 0.005;
+constexpr double GRADE_PHI           = 0.92;
+constexpr double GRADE_MIN = 0.05, GRADE_MAX = 0.11;
+const    double GRADE_INNOV_SD = GRADE_STATIONARY_SD * std::sqrt(1.0 - GRADE_PHI*GRADE_PHI);
 
-enum Kind { MINE, TRANSFER, CRUSHER, FLOTATION, DIGEST };
+// Basket: fixed deposit constant — real Mountain Pass bastnäsite pattern,
+// renormalized over the five tracked elements: La 33 %, Ce 50 %, Pr 4 %,
+// Nd 12 %, Dy 0.1 %. Sums to 1; set by the mineral's crystal lattice.
+constexpr double BASKET[] = {0.333, 0.505, 0.040, 0.121, 0.001};
+// elements: La, Ce, Pr, Nd, Dy
+constexpr int    N_ELEMS = sizeof(BASKET) / sizeof(BASKET[0]);
 
-struct Node {            // one machine: works on one batch at a time
-    const char *name;
-    Kind   kind;
-    int    cap;             // input buffer size [batches]
-    double travel_h = 0;    // TRANSFER only: how long the trip takes [h]
+// Stock feedback on mining pace (see miner bullet above).
+constexpr double STOCK_TARGET   = 150.0; // t of ore the mine aims to keep piled
+constexpr double MINE_SPEED_MIN = 0.5;   // pace multiplier when the pad is full
+constexpr double MINE_SPEED_MAX = 2.0;   // pace multiplier when the pad runs dry
 
-    Batch  in[QMAX] = {};   // input buffer, ring: oldest at in_head
-    int    in_head = 0, in_count = 0;
+// #####################################################################
+// Imported additives (Dy oxide for the magnet line): memoryless shipping
+// gaps. Lives in its own blob — nothing in the ore chain consumes it yet.
+constexpr double ADDITIVE_LOT_TONS     = 10.0;        // t per delivery
+constexpr double ADDITIVE_ARRIVAL_MEAN = 10.0 * DAY;  // ≈ 1 t/day
+constexpr int    ADDITIVE_ELEM         = N_ELEMS - 1; // Dy
 
-    bool   full    = false; // holds a batch
-    i64    done_at = 0;     // when that batch is finished
-    Batch  b       = {};
-};
+// #####################################################################
+// Crusher params
+constexpr double CRUSHER_MIN_TIME = 1 * HOUR;
+constexpr double CRUSHER_MAX_TIME = 1.5 * HOUR;
 
-struct Edge {
-    int from, to;           // node ids
-};
+// #####################################################################
+// Flotation params
+constexpr double FLOTATION_MIN_TIME = 5 * HOUR;
+constexpr double FLOTATION_MID_TIME = 7 * HOUR;
+constexpr double FLOTATION_MAX_TIME = 11 * HOUR;
 
-// --- the plant ---
-enum { MINE_1, HAUL_1, CRUSHER_1, BELT_1, FLOTATION_1, PIPE_1, DIGEST_1, N_NODES };
+// REO recovery into concentrate: Tri(0.72, 0.80, 0.88) — plant-typical
+// 70–85 % [M]; element-uniform (recovery is mineral-driven, not element-driven).
+constexpr double FLOTATION_MIN_RECOVERY = 0.72;
+constexpr double FLOTATION_MID_RECOVERY = 0.80;
+constexpr double FLOTATION_MAX_RECOVERY = 0.88;
 
-Node nodes[N_NODES] = { // same order as the ids above
-    //                      cap  travel [h]
-    {"mine",      MINE,      0},
-    {"haul",      TRANSFER,  1,  30.0 / 60}, // a truck to the crusher
-    {"crusher",   CRUSHER,  10},             // ore pad
-    {"belt",      TRANSFER,  1,  15.0 / 60}, // conveyor to flotation
-    {"flotation", FLOTATION, 10},            // crushed ore stockpile
-    {"pipe",      TRANSFER,  1,  10.0 / 60}, // slurry pipe to the concentrate store
-    {"digest",    DIGEST,   13},             // Q_CONC (~150 t of concentrate); stub for Zone 2
-};
+// Concentrate grade setpoint — real concentrates run 40–60 % REO [H].
+constexpr double CONC_GRADE = 0.55;
 
-Edge edges[] = {
-    {MINE_1,      HAUL_1},
-    {HAUL_1,      CRUSHER_1},
-    {CRUSHER_1,   BELT_1},
-    {BELT_1,      FLOTATION_1},
-    {FLOTATION_1, PIPE_1},
-    {PIPE_1,      DIGEST_1},
-};
+// Ground simulation params.
+constexpr i64 SEED  = 'm' + 'e' + 'o' + 'w';
 
-struct World {
-    i64 t = 0;
-    i64 clock_jumps = 0;
-    i64 turns_taken = 0;
-    std::mt19937_64 rng; // the only RNG; draw order is fixed by the turn order
-    double mined[N] = {}, tailings[N] = {}, digested[N] = {};
-};
-
-World w; // the one simulation state, used by every function below
-
-static void die(const char *why) {
-    fprintf(stderr, "simulation bug: %s\n", why);
+[[noreturn]] void assert_fail(const char* why) {
+    std::cerr << "[Assert]: " << why;
     exit(1);
 }
 
-static i64 hours_to_ms(double h) { return (i64)std::llround(h * HOUR); }
+// Macro (not function) so the optimizer can prune the impossible path after a
+// failed check — keeps -Warray-bounds quiet.
+#define assert(cond, why) ((cond) ? (void)0 : assert_fail(why))
 
-static double uniform(double lo, double hi) {
-    return std::uniform_real_distribution<double>(lo, hi)(w.rng);
+// Standard normal CDF: Phi(x) = 0.5 * (1 + erf(x / sqrt(2))).
+static double normal_cdf(double x) {
+    return 0.5 * (1.0 + std::erf(x * 0.70710678118654752));
 }
 
-static double exponential(double mean) {
-    return std::exponential_distribution<double>(1.0 / mean)(w.rng);
+// Inverse error function (Abramowitz & Stegun 7.1.26-based approximation).
+static double erfinv(double y) {
+    constexpr double A  = 0.147;
+    constexpr double PI = 3.14159265358979323846;
+    double ln = std::log(1.0 - y * y);
+    double t  = 2.0 / (PI * A) + ln / 2.0;
+    return std::copysign(std::sqrt(-t + std::sqrt(t * t - ln / A)), y);
 }
 
-static double triangular(double lo, double mode, double hi) {
-    double u = uniform(0, 1);
-    if (u < (mode - lo) / (hi - lo)) return lo + std::sqrt(u * (hi - lo) * (mode - lo));
-    return hi - std::sqrt((1 - u) * (hi - lo) * (hi - mode));
-}
+class C_World {
+    public:
+        const i64 END = 5 * 365 * DAY; // assignment experiment: several years
 
-static bool step(int id) {
-    Node &n = nodes[id];
-    bool changed = false;
+        i64 time = 0;
 
-    // 1. Finished: push the batch into the emptiest next node that has room.
-    //    If none has room, the batch stays inside (the machine is blocked).
-    //    At a digest node the batch leaves the plant instead.
-    if (n.full && n.done_at <= w.t && n.kind == DIGEST) {
-        for (int el = 0; el < N; el++) w.digested[el] += n.b.reo[el];
-        n.full = false;
-        changed = true;
-    }
+        // Tailings sink (flotation reject): unrecovered REO per element + gangue.
+        double tailings[N_ELEMS] = {};
+        double tailings_gangue = 0;
+
+        // Single global RNG
+        std::mt19937_64 rng;
+
+        double uniform(double lo, double hi) {
+            return std::uniform_real_distribution<double>(lo, hi)(rng);
+        }
+
+        double exponential(double mean) {
+            return std::exponential_distribution<double>(1.0 / mean)(rng);
+        }
+
+        double normal_distribution(double mean, double deviation) {
+            return std::normal_distribution<double>(mean, deviation)(rng);
+        }
+
+        double normal_clamped(double mean, double deviation, std::pair<double, double>clamp) {
+            // Exact truncated normal: draw u uniformly between the boundary CDF
+            // values, then map back through the inverse normal CDF.
+            double lo = normal_cdf((clamp.first  - mean) / deviation);
+            double hi = normal_cdf((clamp.second - mean) / deviation);
+            double u  = uniform(lo, hi);
+            return mean + deviation * std::sqrt(2.0) * erfinv(2.0 * u - 1.0);
+        }
+
+        double triangular(double lo, double mode, double hi) {
+            double u = uniform(0, 1);
+            if (u < (mode - lo) / (hi - lo)) return lo + std::sqrt(u * (hi - lo) * (mode - lo));
+            return hi - std::sqrt((1 - u) * (hi - lo) * (hi - mode));
+        }
+
+        double gamma(double n) {
+            return std::gamma_distribution<double>(n)(rng);
+        }
+
+        C_World() {
+            rng.seed(SEED);
+        }
+};
+
+C_World g_w;
+
+constexpr int MAX_RING_BUFFER_SIZE = 100;
+
+typedef struct T_Ring_Buffer {
+    i64 buf[MAX_RING_BUFFER_SIZE];
     
-    if (n.full && n.done_at <= w.t) {
-        Node *next = nullptr;
-        for (Edge &e : edges) {
-            if (e.from != id) continue;
-            Node &to = nodes[e.to];
-            if (to.in_count < to.cap && (!next || to.in_count < next->in_count)) next = &to;
-        }
-        if (next) {
-            if (next->in_count == QMAX) die("input buffer cap larger than QMAX");
-            next->in[(next->in_head + next->in_count) % QMAX] = n.b;
-            next->in_count++;
-            n.full = false;
-        }
-        changed = !n.full;
-    }
-    if (n.full) return changed;
+    i64 size       = MAX_RING_BUFFER_SIZE;
+    i64 read_head  = 0;
+    i64 write_head = 0;
 
-    // 2. Idle: take the oldest batch from the input buffer
-    //    (a mine makes its own, in its case below).
-    if (n.kind != MINE) {
-        if (n.in_count == 0) return changed;
-        n.b = n.in[n.in_head]; // its slot frees as soon as work starts
-        n.in_head = (n.in_head + 1) % QMAX;
-        n.in_count--;
-    }
+} T_Ring_Buffer;
 
-    // 3. Work on it: what happens to the batch and for how long.
-    switch (n.kind) {
-    case MINE: {
-        constexpr double TONS_IN_BASKET_MIN = 80;
-        constexpr double TONS_IN_BASKET_MAX = 120;
-        constexpr double ARRIVAL_MEAN = 10.0; // [h] time to dig one batch
-        constexpr double BASKET_ALPHA[N] = {2.4, 5.0, 0.55, 1.7, 0.18}; // Dirichlet
-
-        double tons = uniform(TONS_IN_BASKET_MIN, TONS_IN_BASKET_MAX);
-        double grade;
-        do {
-            grade = std::normal_distribution<double>(0.08, 0.01)(w.rng);
-        } while (grade < 0.05 || grade > 0.11);
-
-        // element basket: Dirichlet = normalized Gamma draws
-        double basket[N], sum = 0;
-        for (int el = 0; el < N; el++) sum += basket[el] = std::gamma_distribution<double>(BASKET_ALPHA[el])(w.rng);
-
-        n.b = {tons, {}};
-        for (int el = 0; el < N; el++) {
-            n.b.reo[el] = tons * grade * basket[el] / sum;
-            w.mined[el] += n.b.reo[el];
-        }
-        n.done_at = w.t + hours_to_ms(exponential(ARRIVAL_MEAN));
-        break;
-    }
+T_Ring_Buffer init_ring_buf(i64 size) {
+    T_Ring_Buffer t;
+    t.size = size;
     
-    case TRANSFER: {
-        n.done_at = w.t + hours_to_ms(n.travel_h);
-        break;
+    return t;
+}
+
+// One aggregate material mass — "the blob". elem[e] is the contained REO
+// tonnage of element e; waste is the gangue. Ore tons = Σ elem + waste; head
+// grade is derivable: Σ elem / ore tons. No batch identity: a node's blob is
+// a blend of everything it received, like a real stockpile.
+typedef struct T_Mass {
+    double elem[N_ELEMS] = {};
+    double waste = 0;
+} T_Mass;
+
+enum E_Node_Type {
+    E_MINER,
+    E_TRANSFER, // Can also split based on rules.
+    E_ADDITIVE_SRC, // imported additives (e.g. Dy oxide) — pools into g_additives
+    E_CRUSHER,
+    E_FLOTATION,
+};
+
+typedef struct T_Node {
+    T_ID id;
+    E_Node_Type type;
+    T_Ring_Buffer buf;
+
+    T_ID input = -1;
+    T_ID output = -1;
+
+    i64 done_at = -1;
+
+    T_Mass mass; // the node's blob
+
+    // E_TRANSFER
+    i64 transfer_length = 0;
+
+} T_Node;
+
+constexpr int MAX_NODE_COUNT = 100;
+T_Node g_nodes[MAX_NODE_COUNT];
+int g_node_count = 0;
+
+// Imported additive stock — its own blob, outside the ore chain (see params).
+// Deliveries arrive on memoryless shipping gaps and just pool up here until
+// a consumer (the magnet line) exists. Nothing in the ore chain consumes it.
+T_Mass g_additives;
+
+T_Node* init_node(E_Node_Type type, i64 buf_size) {
+    // direct if (not the assert macro): GCC's -Warray-bounds only prunes the
+    // out-of-bounds path when the guard is a plain statement in this function.
+    if (g_node_count >= MAX_NODE_COUNT) assert_fail("Too many nodes. Increase MAX_NODE_COUNT.");
+    T_Node* n = &g_nodes[g_node_count];
+    n->id = g_node_count++;
+    n->type = type;
+    n->buf = init_ring_buf(buf_size);
+
+    return n;
+}
+
+T_Node* init_transfer_node(i64 length) {
+    T_Node* n = init_node(E_TRANSFER, 0);
+    n->transfer_length = length;
+
+    return n;
+}
+
+void link_nodes(T_ID from, T_ID to) {
+    T_Node* from_n = &g_nodes[from];
+    T_Node* to_n   = &g_nodes[to];
+
+    if(to_n->type != E_TRANSFER) {
+        assert(false, "Output node isn't transfer.");
     }
 
-    case CRUSHER: {
-        n.done_at = w.t + hours_to_ms(uniform(1.0, 1.5));
-        break;
+    from_n->output = to_n->id;
+    to_n->input    = from_n->id;
+}
+
+b32 step(T_ID id) {
+    T_Node* n = &g_nodes[id];
+    assert(n->output != -1, "Node has no output.");
+    if (n->type == E_TRANSFER) assert(n->input != -1, "Transfer has no input.");
+
+    switch(n->type) {
+        case E_MINER:
+        {
+            // Grade of received ore. Changes over time.
+            static double grade_state = GRADE_MEAN;
+            grade_state = GRADE_MEAN
+                        + GRADE_PHI * (grade_state - GRADE_MEAN)
+                        + g_w.normal_distribution(0.0, GRADE_INNOV_SD);
+            if (grade_state < GRADE_MIN) grade_state = GRADE_MIN;
+            if (grade_state > GRADE_MAX) grade_state = GRADE_MAX;
+
+            // Total amount of raw ore received
+            double tons = g_w.uniform(TONS_IN_BASKET_MIN, TONS_IN_BASKET_MAX);
+
+            double reo = 0;
+            for (int el = 0; el < N_ELEMS; el++) {
+                reo += n->mass.elem[el] += tons * grade_state * BASKET[el];
+            }
+            n->mass.waste += tons - reo;
+
+            // Mine throttles against its own stockpile: pad near target runs at
+            // nominal pace, a full pad slows the mine, a dry pad speeds it up.
+            double stock = n->mass.waste;
+            for (int el = 0; el < N_ELEMS; el++) stock += n->mass.elem[el];
+            double speed = std::clamp(STOCK_TARGET / stock, MINE_SPEED_MIN, MINE_SPEED_MAX);
+
+            n->done_at = g_w.time + g_w.exponential(ARRIVAL_MEAN / speed);
+        } break;
+
+
+        case E_TRANSFER:
+        {
+            n->done_at = g_w.time + n->transfer_length;
+        } break;
+
+
+        case E_ADDITIVE_SRC:
+        {
+            // imported additive delivery on memoryless shipping gaps — pools
+            // into its own blob; nothing in the ore chain consumes it yet
+            g_additives.elem[ADDITIVE_ELEM] += ADDITIVE_LOT_TONS;
+            n->done_at = g_w.time + g_w.exponential(ADDITIVE_ARRIVAL_MEAN);
+        } break;
+
+
+        case E_CRUSHER:
+        {
+            n->done_at = g_w.time + g_w.uniform(CRUSHER_MIN_TIME, CRUSHER_MAX_TIME);
+        } break;
+
+
+        case E_FLOTATION:
+        {
+            // Mass map on the holdup blob: recover r of the REO into a
+            // concentrate at the grade setpoint, the rest goes to tailings.
+            //   conc mass = recovered/CONC_GRADE; the mass above pure REO is
+            //   gangue reporting to the concentrate, the rest to tailings.
+            double r = g_w.triangular(FLOTATION_MIN_RECOVERY,
+                                      FLOTATION_MID_RECOVERY,
+                                      FLOTATION_MAX_RECOVERY);
+
+            double rec_reo = 0;
+            for (int el = 0; el < N_ELEMS; el++) {
+                g_w.tailings[el] += n->mass.elem[el] * (1.0 - r);
+                n->mass.elem[el] *= r;
+                rec_reo += n->mass.elem[el];
+            }
+
+            double conc_mass = rec_reo / CONC_GRADE;
+            double gangue_to_conc = conc_mass - rec_reo;
+            g_w.tailings_gangue += n->mass.waste - gangue_to_conc;
+            n->mass.waste = gangue_to_conc;
+
+            n->done_at = g_w.time + g_w.triangular(FLOTATION_MIN_TIME,
+                                                   FLOTATION_MID_TIME,
+                                                   FLOTATION_MAX_TIME);
+
+        } break;
+
+
+        default:
+        {
+            assert(false, "Unhandled/Wrong node type.");
+        } break;
     }
 
-    case FLOTATION: {
-        constexpr double CONC_GRADE = 0.55; // REO fraction of concentrate
-
-        double r = triangular(0.72, 0.80, 0.88); // recovery
-        double reo = 0;
-        for (int el = 0; el < N; el++) {
-            w.tailings[el] += n.b.reo[el] * (1 - r);
-            n.b.reo[el] *= r;
-            reo += n.b.reo[el];
-        }
-        n.b.tons = reo / CONC_GRADE;
-        n.done_at = w.t + hours_to_ms(triangular(5, 7, 11));
-        break;
-    }
-
-    case DIGEST: {
-        constexpr double DIGEST_RATE = 1.0; // [t/h] Zone 2 stub consumption rate
-
-        n.done_at = w.t + hours_to_ms(exponential(n.b.tons / DIGEST_RATE));
-        break;
-    }
-    }
-
-    n.full = true;
     return true;
 }
 
-static i64 next_event_time() {
-    i64 next = (w.t / DAY + 1) * DAY; // daily report
-    for (Node &n : nodes)
-        if (n.full && n.done_at > w.t) next = std::min(next, n.done_at);
-    return next;
-}
 
-// One round of turns at the current moment: every node, in array order.
-// Returns whether anything changed. Once a round changes nothing the moment
-// is settled, and the observers look at it.
-static bool sweep() {
-    w.turns_taken++;
-    bool changed = false;
-    for (int id = 0; id < N_NODES; id++) changed |= step(id);
-    if (changed) return true;
+int main(void) {
+    // element shares: fixed deposit constant
+    for (int el = 0; el < N_ELEMS; el++) std::cout << BASKET[el] << " ";
+    std::cout << "\n";
 
-    // mass balance: every ton of mined REO is in tailings, digested, or still in the plant
-    for (int el = 0; el < N; el++) {
-        double where = w.tailings[el] + w.digested[el];
-        for (Node &n : nodes) {
-            for (int i = 0; i < n.in_count; i++) where += n.in[(n.in_head + i) % QMAX].reo[el];
-            if (n.full) where += n.b.reo[el];
-        }
-        if (std::fabs(w.mined[el] - where) > 1e-9 * w.mined[el]) die("mass balance broken");
-    }
-
-    // daily report: batches in each input buffer, then the blocked machines
-    if (w.t % DAY == 0) {
-        if (w.t == 0) {
-            printf("day");
-            for (Node &n : nodes) printf(" %9s", n.name);
-            printf("  blocked\n");
-        }
-        printf("%3lld", (long long)(w.t / DAY));
-        for (Node &n : nodes) printf("     %2d/%-2d", n.in_count, n.cap);
-        printf(" ");
-        for (Node &n : nodes)
-            if (n.full && n.done_at <= w.t) printf(" %s", n.name);
-        printf("\n");
-    }
-    return false;
-}
-
-int main() {
-    w.rng.seed(SEED);
-
-    for (;;) {
-        int guard = 0;
-        while (sweep()) {
-            if (++guard >= TURN_CAP)
-                die("kept changing at the same moment, never settled");
-        }
-
-        i64 next = next_event_time();
-        if (next > T_END) break;
-        w.t = next;
-        w.clock_jumps++;
-    }
-
-    printf("run finished: %lld clock jumps, %lld turns\n", (long long)w.clock_jumps, (long long)w.turns_taken);
     return 0;
 }
