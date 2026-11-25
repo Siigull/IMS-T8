@@ -253,6 +253,11 @@ enum E_Processor_State : u64 {
     S_FINISH,
 };
 
+enum E_Conveyor_State : u64 {
+    C_MOVING,
+    C_LOADING,
+};
+
 // TODO(Sigull): Maybe I am just too sleep deprived but these wrods are too hard. 
 enum E_Truck_State : u64 {
     TRUCK_LOAD,
@@ -277,17 +282,19 @@ typedef struct T_Node {
 
     i64 mass_capacity = INT64_MAX;
 
+
     // N_TRUCK
     E_Truck_State truck_state = TRUCK_LOAD;
 
     // N_CONVEYOR
+    E_Conveyor_State conv_state = C_LOADING;
     T_Mass belt[BELT_CELLS];
     i64 belt_size = BELT_CELLS;
-    i64 belt_head = 0;
+    i64 belt_head = 1;
 
     // N_TRANSFER
     i64 transfer_length = 0;
-
+    
     // N_FLOTATION && N_CRUSHER
     E_Processor_State proc_state = S_NULL;
 
@@ -314,6 +321,8 @@ typedef struct T_Transaction {
 
     // T_HEAD_INCREMENT
     T_Node* conveyor;
+    E_Conveyor_State* conv_state;
+    E_Conveyor_State new_conv_state;
 
     // T_STATE
     E_Truck_State* state_var;
@@ -373,6 +382,14 @@ void trans_add_truck_state(T_Transaction* t, E_Truck_State* state_var, E_Truck_S
     t->state_var = state_var;
     t->new_state = new_state;
 }
+
+void trans_add_conveyor_state(T_Transaction* t, E_Conveyor_State* state_var, E_Conveyor_State new_state) {
+    debug_assert(t->type & T_STATE, "State 1");
+
+    t->conv_state = state_var;
+    t->new_conv_state = new_state;
+}
+
 
 void trans_add_tick(T_Transaction* t, i64* tick_var, i64 timestamp) {
     debug_assert(timestamp > g_w.time, "Tick 1");
@@ -636,7 +653,11 @@ void tick(T_ID id) {
 
         case N_CONVEYOR:
         {
-            // Next tick in send.
+            if (n->conv_state != C_MOVING) {
+                assert(false, "Bad conveyor tick");
+            }
+
+            n->conv_state = C_LOADING;
         } break;
 
 
@@ -738,6 +759,8 @@ b32 transfer(T_ID id) {
 
         case N_CONVEYOR:
         {
+            if (n->conv_state == C_MOVING) break;
+
             // Sending
             i64 read_head  = n->belt_head % n->belt_size;
             T_Transaction* t1;
@@ -752,10 +775,10 @@ b32 transfer(T_ID id) {
             // Increment head
             T_Transaction* t3 = make_transaction(T_HEAD_INCREMENT);
             trans_add_head(t3, n); // Takes care of the fact, that it can only increment when at read head 0 tons.
+            trans_add_tick(t3, &n->next_tick, g_w.time + BELT_TICK);
+            trans_add_conveyor_state(t3, &n->conv_state, C_MOVING);
             //#############################
 
-
-            n->next_tick = g_w.time + BELT_TICK;
         } break;
 
         default:
