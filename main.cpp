@@ -253,17 +253,16 @@ enum E_Processor_State : u64 {
     S_FINISH,
 };
 
-
 // TODO(Sigull): Maybe I am just too sleep deprived but these wrods are too hard. 
 enum E_Truck_State : u64 {
-    TRUCK_LOADING, // parked at the mine, waiting for a full load
-    TRUCK_HAULING, // loaded, driving to the crusher. And unloading at crusher.
-    TRUCK_LOADED,  // finished loading, schedule travel to ore extraction
-    TRUCK_HAULED,  // finished hauling, schedule travel to mine
+    TRUCK_LOAD,
+    TRUCK_HAUL,
+    TRUCK_TRAVEL_TO_MINE,
+    TRUCK_TRAVEL_TO_EXTRACTION,  
 };
 
 typedef struct T_Node {
-    T_ID id;
+    T_ID id = -1;
     E_Node_Type type;
 
     T_ID input = -1;
@@ -279,7 +278,7 @@ typedef struct T_Node {
     i64 mass_capacity = INT64_MAX;
 
     // N_TRUCK
-    E_Truck_State truck_state = TRUCK_LOADING;
+    E_Truck_State truck_state = TRUCK_LOAD;
 
     // N_CONVEYOR
     T_Mass belt[BELT_CELLS];
@@ -337,7 +336,7 @@ T_Transaction* make_transaction(u64 type) {
             "Can't have move and head increment in single transaction.");
 
     T_Transaction* t = &g_transactions[g_transaction_count++];
-    std::memset(t, 0, sizeof(T_Transaction));
+    *t = T_Transaction();
     
     t->type = type;
     t->not_done = true;
@@ -465,17 +464,26 @@ static b32 enact_transaction(T_ID id) {
     }
 
 
-
     // Kind of a hack. Wake up floation tank when move and tank is idle.
     // Reference comment in N_FLOATION in tick().
     if (t->type & T_MOVE) {
         T_Node* dst = t->dst;
         // proc_state only on nodes, which can be woken up.
         bool proc_state_idle = dst->proc_state == S_IDLE; 
-        bool is_tick_in_past = dst->next_tick <= g_w.time;
+        bool is_tick_in_past = dst->next_tick < g_w.time;
 
         if (proc_state_idle && is_tick_in_past) {
             dst->next_tick = g_w.time + 5 * MIN;
+        }
+
+        // TODO(Sigull): Maybe don't care about the states at all and just 
+        // wake things when the next tick is in past. Thought there might be 
+        // issues with this, but it looks more correct to me.
+        T_Node* src = t->src;
+        is_tick_in_past = src->next_tick < g_w.time;
+
+        if (is_tick_in_past) {
+            src->next_tick = g_w.time + 5 * MIN;
         }
     }
 
@@ -488,10 +496,9 @@ T_Node g_nodes[MAX_NODE_COUNT];
 int g_node_count = 0;
 
 // Memory helpers
-T_ID g_send_nodes[MAX_NODE_COUNT];
-int g_send_node_count = 0;
-T_ID g_receive_nodes[MAX_NODE_COUNT];
-int g_receive_node_count = 0;
+T_ID g_transfer_nodes[MAX_NODE_COUNT];
+int g_transfer_node_count = 0;
+
 
 // Imported additive stock — its own blob, outside the ore chain (see params).
 T_Mass g_additives;
@@ -500,10 +507,17 @@ T_Node* init_node(E_Node_Type type) {
     assert(g_node_count < MAX_NODE_COUNT, "Too many nodes. Increase MAX_NODE_COUNT.");
 
     T_Node* n = &g_nodes[g_node_count];
-    memset(n, 0, sizeof(T_Node));
+    
     n->id = g_node_count++;
     n->type = type;
+    n->next_tick = -1;
+    
+    // Transfer nodes
+    if (type == N_CONVEYOR || type == N_TRUCK) {
+        g_transfer_nodes[g_transfer_node_count++] = n->id;
+    }
 
+    // Nodes with state, which can be woken up by getting a transfer.
     if (type == N_CRUSHER || type == N_FLOTATION) {
         n->proc_state = S_IDLE;
     }
@@ -535,16 +549,6 @@ T_Node* init_transfer_node(i64 length) {
 }
 
 void link_nodes(T_ID from, T_ID to) {
-    for(int i=0; i<g_send_node_count; i++) {
-        assert(g_send_nodes[i] != from, "Send to only one node for now.");
-    }
-    g_send_nodes[g_send_node_count++] = from;
-
-    for(int i=0; i<g_receive_node_count; i++) {
-        assert(g_receive_nodes[i] != to, "Receive from only one node for now.");
-    }
-    g_receive_nodes[g_receive_node_count++] = to;
-
     T_Node* from_n = get_node(from);
     T_Node* to_n   = get_node(to);
 
@@ -593,12 +597,15 @@ void tick(T_ID id) {
 
 
         case N_TRUCK:
-        {
-            if (n->truck_state == TRUCK_HAULED) {
-                // Might not need to be a transaction. It is anyway.
-                T_Transaction* t = make_transaction(T_STATE | T_TICK);
-                trans_add_truck_state(t, &n->truck_state, TRUCK_LOADING);
-                trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
+        {            
+            if (n->truck_state == TRUCK_TRAVEL_TO_EXTRACTION) {
+                n->truck_state = TRUCK_HAUL;
+
+            } else if (n->truck_state == TRUCK_TRAVEL_TO_MINE) {
+                n->truck_state = TRUCK_LOAD;
+            
+            } else {
+                assert(false, "Truck bad tick.");
             }
         } break;
 
@@ -694,7 +701,7 @@ void tick(T_ID id) {
 
 // Send and receive. Mostly for Transfer processors.
 // NOTE(Sigull): Two transferers after each other probably not handled well.
-b32 send(T_ID id) {
+b32 transfer(T_ID id) {
     T_Node* n = get_node(id);
 
     assert(n->output != -1, "Mistake in initing g_send_nodes.");
@@ -702,13 +709,6 @@ b32 send(T_ID id) {
     T_Node* src = get_node(n->input);
 
     switch(n->type) {
-        case N_MINER:
-        case N_ADDITIVE_SRC:
-        case N_CRUSHER:
-        case N_FLOTATION:
-        {}break;
-
-
         // Maybe better to have a multiway wake up model.
         // NOTE(Sigull): Yep, can't keep my eyes open. See the mistakes,
         //               but I just can't get a hold of them. It's like 
@@ -718,37 +718,20 @@ b32 send(T_ID id) {
         //               from the top back into the mind. And I can't meow.
         case N_TRUCK:
         {
-            if (n->truck_state == TRUCK_HAULED) {
-                T_Transaction* t1 = make_transaction(T_MOVE | T_STATE);
-                trans_add_move(t1, &src->mass, src, &n->mass, n, TRUCK_CAPACITY);
-                trans_add_truck_state(t1, &n->truck_state, TRUCK_LOADING);
+            if (n->truck_state == TRUCK_HAUL) {
+                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
+                trans_add_move(t, &n->mass, n, &dst->mass, dst, mass_tons(&n->mass));
+                trans_add_truck_state(t, &n->truck_state, TRUCK_TRAVEL_TO_MINE);
                 
-                Transaction* t2 = 
-                trans_add_tick(t, &n->next_tick, g_w.time + (5 * MIN));
-
-            } else if(n->truck_state == TRUCK_LOADED) {
-                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
-                trans_add_move(t, &n->mass, n, &dst->mass, dst, mass_tons(&n->mass));
-                trans_add_truck_state(t, &n->truck_state, TRUCK_HAULING);
-
-                trans_add_tick(t, &n->next_tick, g_w.time + (5 * MIN));
-
-            } else if(n->truck_state == TRUCK_HAULING) {
-                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
-                trans_add_move(t, &n->mass, n, &dst->mass, dst, mass_tons(&n->mass));
-                trans_add_truck_state(t, &n->truck_state, TRUCK_HAULED);
-
                 trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
 
-            } else if(n->truck_state == TRUCK_LOADING) {
+            } else if(n->truck_state == TRUCK_LOAD) {
                 T_Transaction* t = make_transaction(T_MOVE | T_STATE);
                 trans_add_move(t, &src->mass, src, &n->mass, n, TRUCK_CAPACITY);
-                trans_add_truck_state(t, &n->truck_state, TRUCK_LOADED);
+                trans_add_truck_state(t, &n->truck_state, TRUCK_TRAVEL_TO_EXTRACTION);
 
                 trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
 
-            } else {
-                assert(false, "Unknown truck state");
             }
         } break;
 
@@ -786,12 +769,12 @@ b32 send(T_ID id) {
 
 int main(void) {
     // miner -> truck ─> crusher -> belt ─> flotation -> rejects ─> dam
-    T_Node* miner   = init_node(N_MINER, 0);
-    T_Node* truck   = init_node(N_TRUCK, 0);
-    T_Node* crusher = init_node(N_CRUSHER, 0);
-    T_Node* belt    = init_node(N_CONVEYOR, 0);
-    T_Node* flot    = init_node(N_FLOTATION, 0);
-    T_Node* dam     = init_node(N_TAILINGS, 0);
+    T_Node* miner   = init_node(N_MINER);
+    T_Node* truck   = init_node(N_TRUCK);
+    T_Node* crusher = init_node(N_CRUSHER);
+    T_Node* belt    = init_node(N_CONVEYOR);
+    T_Node* flot    = init_node(N_FLOTATION);
+    T_Node* dam     = init_node(N_TAILINGS);
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
 
@@ -806,6 +789,8 @@ int main(void) {
 
     i64 next_report = 30 * DAY;
     while (g_w.time < g_w.END) {
+        // Clean slate of transactions.
+        // Transactions are only mid tick.
         clear_transactions();
 
         // 1) advance to the earliest due event
@@ -824,13 +809,15 @@ int main(void) {
             break;
         }
 
+        // Ticks at exactly this time.
         g_w.time = best;
         for (int i=0; i<g_node_count; i++) {
             tick(i);
         }
 
-        for (int i=0; i<g_send_node_count; i++) {
-            send(g_send_nodes[i]);
+        // On every tick, if in correct state, transfer nodes try to send/receive.
+        for (int i=0; i<g_transfer_node_count; i++) {
+            transfer(g_transfer_nodes[i]);
         }
 
         b32 changed = true;
