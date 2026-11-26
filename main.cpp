@@ -85,18 +85,24 @@ constexpr double MINE_SPEED_MAX = 2.0;   // pace multiplier when the pad runs dr
 
 
 // ######################## Truck transfer #############################
-// Truck transfer: discrete haulage mine → crusher. Waits for a full load,
-// constant drive time, dumps into the crusher's feed stock on arrival.
+// Truck transfer: discrete haulage mine → crusher. Loads whatever is on
+// the pad, up to TRUCK_CAPACITY — a low pad means a partial load, the
+// truck does not wait for a full one. Constant drive time, dumps into the
+// crusher's feed stock on arrival.
 constexpr double TRUCK_CAPACITY   = 100.0;    // t per load
 constexpr i64    TRUCK_DRIVE_TIME = 1 * HOUR; // one way, loaded or empty
 
 
 // ######################### Conveyor transfer #########################
 // Conveyor transfer: granular in-plant flow crusher → flotation. The belt is
-// a circular buffer of cells; every tick it advances one cell, discharges the
-// tail into the downstream stock and pulls a fresh cell from upstream. It
-// only starts outputting once primed (filled to capacity), then keeps
-// flowing until actually empty (smoother variant — no stop-start pulsing).
+// a circular buffer of cells with distinct ends: every tick the discharge
+// end dumps its cell into the downstream stock while the feed end
+// simultaneously fills the cell behind it from upstream, then the belt
+// advances one cell. A load rides BELT_CELLS - 1 ticks. No priming: the belt
+// outputs whatever reaches the read head (first discharge one transit after
+// the first fill) and keeps advancing while empty (no stop-start pulsing).
+// A cell never takes more than BELT_CELL_CAP: if the read cell can't
+// discharge (downstream full), the belt tops the cell up to cap and holds.
 constexpr i64    BELT_TICK  = 5 * MIN;                         // one iteration
 constexpr double BELT_RATE  = 100.0;                          // t/h
 constexpr int    BELT_CELLS = 6;                              // τ = 30 min
@@ -178,7 +184,7 @@ class C_World {
     public:
         const i64 END = 5 * 365 * DAY; // assignment experiment: several years
 
-        i64 time = 0;
+        i64 time = -1;
 
         // Single global RNG
         std::mt19937_64 rng;
@@ -280,7 +286,11 @@ typedef struct T_Node {
     T_Mass wip;
     T_Mass out;
 
-    i64 mass_capacity = INT64_MAX;
+    // Cap of a destination stock on this node, checked against the dst
+    // T_Mass' live content at enactment time. NOTE for N_CONVEYOR: moves
+    // into the belt target individual cells, so for the belt this is the
+    // PER-CELL cap (set to BELT_CELL_CAP in main).
+    double mass_capacity = HUGE_VAL;
 
 
     // N_TRUCK
@@ -321,12 +331,13 @@ typedef struct T_Transaction {
 
     // T_HEAD_INCREMENT
     T_Node* conveyor;
+    
+    // T_STATE
     E_Conveyor_State* conv_state;
     E_Conveyor_State new_conv_state;
 
-    // T_STATE
-    E_Truck_State* state_var;
-    E_Truck_State new_state;
+    E_Truck_State* truck_state;
+    E_Truck_State new_truck_state;
 
     // T_TICK
     i64* tick_var;
@@ -379,8 +390,8 @@ void trans_add_head(T_Transaction* t, T_Node* conveyor) {
 void trans_add_truck_state(T_Transaction* t, E_Truck_State* state_var, E_Truck_State new_state) {
     debug_assert(t->type & T_STATE, "State 1");
 
-    t->state_var = state_var;
-    t->new_state = new_state;
+    t->truck_state = state_var;
+    t->new_truck_state = new_state;
 }
 
 void trans_add_conveyor_state(T_Transaction* t, E_Conveyor_State* state_var, E_Conveyor_State new_state) {
@@ -435,14 +446,19 @@ static b32 enact_transaction(T_ID id) {
         if (want_amt > to_space_left) want_amt = to_space_left;
         if (want_amt > from_total)    want_amt = from_total;
 
+        // Blend by the source's composition: the tons landing in dst are a
+        // proportional slice of src, so per-element tonnage is conserved.
+        // (dst's own composition only describes what's already there — a
+        // fresh-empty dst is fine, no to_frac / to_total division.)
         double from_frac = want_amt / from_total;
-        double to_frac   = want_amt / to_total;
         for (int el = 0; el < N_ELEMS; el++) {
-            dst->elem[el] += dst->elem[el] * to_frac;
-            src->elem[el] -= src->elem[el] * from_frac;
+            double moved = src->elem[el] * from_frac;
+            dst->elem[el] += moved;
+            src->elem[el] -= moved;
         }
-        dst->waste += dst->waste * to_frac;
-        src->waste -= src->waste * from_frac;
+        double moved_waste = src->waste * from_frac;
+        dst->waste += moved_waste;
+        src->waste -= moved_waste;
 
     } else if(t->mass_dst || t->mass_src || t->dst || t->amt) {
         debug_assert(false, "Uninitialized enact Move");
@@ -466,9 +482,21 @@ static b32 enact_transaction(T_ID id) {
 
     // Change truck state.
     if(t->type & T_STATE) {
-        *t->state_var = t->new_state;
+        assert(t->truck_state == NULL || t->conv_state == NULL, 
+            "Can't change state on truck and conv in the same transaction.");
 
-    } else if(t->state_var || t->new_state) {
+        if (t->truck_state != NULL) {
+            *t->truck_state = t->new_truck_state;
+        
+        } else if (t->conv_state != NULL) {
+            *t->conv_state = t->new_conv_state;
+
+        } else {
+            assert(false, "State change improperly init.");
+        }
+
+
+    } else if(t->truck_state || t->new_truck_state) {
         debug_assert(false, "Uninitialized enact State");
     }
 
@@ -486,10 +514,11 @@ static b32 enact_transaction(T_ID id) {
     if (t->type & T_MOVE) {
         T_Node* dst = t->dst;
         // proc_state only on nodes, which can be woken up.
-        bool proc_state_idle = dst->proc_state == S_IDLE; 
+        bool proc_state_idle = dst->proc_state == S_IDLE;
         bool is_tick_in_past = dst->next_tick < g_w.time;
+        bool not_transfer = dst->type != N_TRUCK && dst->type != N_CONVEYOR;
 
-        if (proc_state_idle && is_tick_in_past) {
+        if (proc_state_idle && is_tick_in_past && not_transfer) {
             dst->next_tick = g_w.time + 5 * MIN;
         }
 
@@ -498,8 +527,9 @@ static b32 enact_transaction(T_ID id) {
         // issues with this, but it looks more correct to me.
         T_Node* src = t->src;
         is_tick_in_past = src->next_tick < g_w.time;
+        not_transfer = src->type != N_TRUCK && src->type != N_CONVEYOR;
 
-        if (is_tick_in_past) {
+        if (is_tick_in_past && not_transfer) {
             src->next_tick = g_w.time + 5 * MIN;
         }
     }
@@ -687,6 +717,7 @@ void tick(T_ID id) {
                 inner_node_mass_move(n, &n->wip, &n->out);
 
                 // TODO(Sigull): How long does this take irl.
+                n->proc_state = S_IDLE;
                 n->next_tick = g_w.time + 5 * MIN;
             
             // CASE S_IDLE
@@ -740,14 +771,14 @@ b32 transfer(T_ID id) {
         case N_TRUCK:
         {
             if (n->truck_state == TRUCK_HAUL) {
-                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
+                T_Transaction* t = make_transaction(T_MOVE | T_STATE | T_TICK);
                 trans_add_move(t, &n->mass, n, &dst->mass, dst, mass_tons(&n->mass));
                 trans_add_truck_state(t, &n->truck_state, TRUCK_TRAVEL_TO_MINE);
                 
                 trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
 
             } else if(n->truck_state == TRUCK_LOAD) {
-                T_Transaction* t = make_transaction(T_MOVE | T_STATE);
+                T_Transaction* t = make_transaction(T_MOVE | T_STATE | T_TICK);
                 trans_add_move(t, &src->mass, src, &n->mass, n, TRUCK_CAPACITY);
                 trans_add_truck_state(t, &n->truck_state, TRUCK_TRAVEL_TO_EXTRACTION);
 
@@ -759,26 +790,25 @@ b32 transfer(T_ID id) {
 
         case N_CONVEYOR:
         {
-            if (n->conv_state == C_MOVING) break;
-
-            // Sending
-            i64 read_head  = n->belt_head % n->belt_size;
-            T_Transaction* t1;
-            t1 = make_transaction(T_MOVE);
-            trans_add_move(t1, &n->belt[read_head], n, &dst->mass, dst, mass_tons(&n->belt[read_head]));
-
-            // Receiving
-            i64 write_head = (n->belt_head - 1) % n->belt_size;
-            T_Transaction* t2 = make_transaction(T_MOVE);
-            trans_add_move(t2, &src->out, src, &n->belt[write_head], n, BELT_CELL_CAP);
-
-            // Increment head
-            T_Transaction* t3 = make_transaction(T_HEAD_INCREMENT);
-            trans_add_head(t3, n); // Takes care of the fact, that it can only increment when at read head 0 tons.
-            trans_add_tick(t3, &n->next_tick, g_w.time + BELT_TICK);
-            trans_add_conveyor_state(t3, &n->conv_state, C_MOVING);
-            //#############################
-
+            if (n->conv_state != C_MOVING){
+                // Sending
+                i64 read_head  = n->belt_head % n->belt_size;
+                T_Transaction* t1;
+                t1 = make_transaction(T_MOVE);
+                trans_add_move(t1, &n->belt[read_head], n, &dst->mass, dst, mass_tons(&n->belt[read_head]));
+    
+                // Receiving
+                i64 write_head = (n->belt_head - 1) % n->belt_size;
+                T_Transaction* t2 = make_transaction(T_MOVE);
+                trans_add_move(t2, &src->out, src, &n->belt[write_head], n, BELT_CELL_CAP);
+    
+                // Increment head
+                T_Transaction* t3 = make_transaction(T_HEAD_INCREMENT | T_STATE | T_TICK);
+                trans_add_head(t3, n); // Takes care of the fact, that it can only increment when at read head 0 tons.
+                trans_add_tick(t3, &n->next_tick, g_w.time + BELT_TICK);
+                trans_add_conveyor_state(t3, &n->conv_state, C_MOVING);
+                //#############################
+            }
         } break;
 
         default:
@@ -801,6 +831,12 @@ int main(void) {
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
 
+    // Belt cells cap per cell: every move into a belt cell is clamped to
+    // that cell's remaining space at enactment time, so a cell can never
+    // exceed BELT_CELL_CAP — including when a cell is blocked downstream
+    // and keeps its old load.
+    belt->mass_capacity = BELT_CELL_CAP;
+
     link_nodes(miner->id,   truck->id);
     link_nodes(truck->id,   crusher->id);
     link_nodes(crusher->id, belt->id);
@@ -812,21 +848,22 @@ int main(void) {
 
     i64 next_report = 30 * DAY;
     while (g_w.time < g_w.END) {
+        g_w.time++;
+
         // Clean slate of transactions.
         // Transactions are only mid tick.
         clear_transactions();
 
         // 1) advance to the earliest due event
-        int next = -1;
-        i64 best = 0;
+        i64 best = g_w.END;
         for (int i = 0; i < g_node_count; i++) {
-            if (g_nodes[i].next_tick == -1) continue;
-            if (next == -1 || g_nodes[i].next_tick < best) {
+            i64 tick_i = g_nodes[i].next_tick;
+
+            if (tick_i < best && tick_i >= g_w.time) {
                 best = g_nodes[i].next_tick;
-                next = i;
             }
         }
-        if (next == -1) {
+        if (best == g_w.END) {
             std::cout << "[engine] stalled: no events scheduled at t = "
                       << g_w.time / DAY << " d\n";
             break;
