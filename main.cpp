@@ -995,6 +995,8 @@ b32 transfer(T_ID id) {
     return true;
 }
 
+#include "sim_trace.h"
+
 // g_w.END if there are no ticks in the future.
 i64 get_closest_node_tick() {
     i64 best = g_w.END;
@@ -1010,7 +1012,7 @@ i64 get_closest_node_tick() {
     return best;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     // miner -> truck ─> crusher -> belt ─> flotation -> rejects ─> dam
     T_Node* miner   = init_node(N_MINER);
     T_Node* truck   = init_node(N_TRUCK);
@@ -1033,6 +1035,17 @@ int main(void) {
     link_nodes(flot->id,    dam->id); // reject stream; product waits in flot->out
     link_nodes(chem->id, chem_sc->id);
 
+    // Trace every tick for the viewer app ("-" disables, see sim_trace.h).
+    trace_set_name(miner->id,         "Mine");
+    trace_set_name(truck->id,          "Haul truck");
+    trace_set_name(crusher->id,        "Crusher");
+    trace_set_name(belt->id,           "Belt conveyor");
+    trace_set_name(flot->id,           "Flotation");
+    trace_set_name(dam->id,           "Tailings dam");
+    trace_set_name(chem->id,           "Acid supplier");
+    trace_set_name(chem_sc->id,        "Acid S&OP");
+    trace_open(argc > 1 ? argv[1] : "trace.bin.gz");
+
     i64 next_report = 30 * DAY;
     while (g_w.time < g_w.END) {
         g_w.time++;
@@ -1053,6 +1066,11 @@ int main(void) {
         }
         g_w.time = next_tick;
 
+        // Which nodes actually get their tick() body run at this time.
+        u64 ticked_mask = 0;
+        for (int i = 0; i < g_node_count; i++) {
+            if (g_nodes[i].next_tick == g_w.time) ticked_mask |= 1ull << i;
+        }
 
         for (int i=0; i<g_node_count; i++) {
             tick(i);
@@ -1072,6 +1090,9 @@ int main(void) {
                 changed |= enact_transaction(i); // If all remaining transactions don't do shit, break.
         }
 
+        // State after everything settled — this is what the viewer sees.
+        trace_tick(ticked_mask);
+
 
         if (g_w.time >= next_report) {
             next_report += 30 * DAY;
@@ -1085,6 +1106,8 @@ int main(void) {
                       << "\n";
         }
     }
+
+    trace_close();
 
     std::cout << "done at day " << g_w.time / DAY << "\n";
     return 0;
