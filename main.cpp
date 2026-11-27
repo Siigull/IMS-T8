@@ -149,6 +149,45 @@ constexpr double ADDITIVE_LOT_TONS     = 10.0;        // t per delivery
 constexpr double ADDITIVE_ARRIVAL_MEAN = 10.0 * DAY;  // ≈ 1 t/day
 constexpr int    ADDITIVE_ELEM         = N_ELEMS - 1; // Dy
 
+
+// ######################### Chemical supply ##########################
+// Bulk H2SO4 for the (future) acid digestion, built FROM SCRATCH: the tank
+// starts empty and the string starts at 0 cars — the contract bootstraps
+// from the first scrum. Three nodes, one next_tick each — no mini-scheduler:
+//
+// - N_CHEM_SRC:           the supplier. Acid tonnage is a T_Mass blob on the
+//                         node (mass.waste — no REO elements, tons() applies),
+//                         tank size = mass_capacity. Runs a FIXED timetable —
+//                         one delivery slot every CHEM_DELIVERY_PERIOD — and
+//                         each slot unloads chem_cars x 85 t: a string of rail
+//                         cars. The timetable is the railway's; the string
+//                         length is the contract's (what the scrum flexes).
+// - N_CHEM_MONTHLY_SCRUM: the S&OP loop. Reads the supplier's trailing burn
+//                         and tank level, sets chem_cars = trailing burn per
+//                         slot plus a deficit correction, rounded to WHOLE
+//                         cars — the step is one 85 t car per weekly slot
+//                         (~12 t/day) and the tank farm absorbs the rounding.
+// - N_CHEM_DISRUPTION:    the market/logistics hazard. Onsets are a renewal
+//                         process; each suspends the supplier's stream for a
+//                         lognormal duration. The supplier slips its slot to
+//                         recovery — lost volume is not made up.
+//
+// One delivery slot per week, ~3 cars per string at the design burn of
+// ~33 t/day (85 t cars [W]). Disruptions (the 2022–23 acid squeeze) are
+// what the tank farm and the scrum exist to absorb.
+constexpr double CHEM_LOT_TONS        = 85.0;      // t per rail car
+constexpr double CHEM_TANK_CAP         = 400.0;     // t, tank farm (mass_capacity)
+constexpr double CHEM_TARGET           = 200.0;     // t, planning target (~6 d cover)
+constexpr double CHEM_CATCHUP_DAYS     = 10.0;      // refill slope: must beat the ~12 t/day
+                                                   // car step, or a deficit could never
+                                                   // add a car (200/10 = 20 > 12)
+constexpr i64    CHEM_DELIVERY_PERIOD  = 7 * DAY;   // fixed timetable: one slot per week
+constexpr i64    CHEM_MAX_CARS         = 6;         // string length cap (~2.2x design burn)
+constexpr i64    CHEM_SCRUM_PERIOD     = 30 * DAY;   // S&OP cadence
+constexpr i64    CHEM_EVENT_MEAN       = 120 * DAY;  // mean gap between disruptions
+constexpr i64    CHEM_DISRUPT_MEDIAN   = 6 * DAY;    // median disruption length
+constexpr double CHEM_DISRUPT_SIGMA    = 0.6;       // lognormal sigma (right-skew)
+
 // Ground simulation params.
 constexpr i64 SEED  = 'm' + 'e' + 'o' + 'w';
 
@@ -187,6 +226,9 @@ class C_World {
         const i64 END = 5 * 365 * DAY; // assignment experiment: several years
 
         i64 time = -1;
+
+        // Chemical disruption
+        i64 chem_disrupted_until = -1;
 
         // Single global RNG
         std::mt19937_64 rng;
@@ -246,11 +288,20 @@ class T_Mass {
         }
 };
 
+class T_Chem_Mass {
+    public:
+        double chem = 0; // H_2SO_4
 
+        double tons() {
+            return chem;
+        }
+};
 
 enum E_Node_Type : u64 {
     N_MINER,
-    N_TRANSFER,     // Can also split based on rules.
+    N_CHEM_SRC, // Imported chemicals (acid for digestion) — the supplier.
+    N_CHEM_DISRUPTION,      // market/logistics event suspending N_CHEM_SRC's stream
+    N_CHEM_MONTHLY_SCRUM,   // S&OP: sets N_CHEM_SRC's contracted rate, wakes it
     N_ADDITIVE_SRC, // imported additives (e.g. Dy oxide) — pools into g_additives
     N_TRUCK,
     N_CRUSHER,
@@ -278,6 +329,9 @@ enum E_Truck_State : u64 {
     TRUCK_TRAVEL_TO_EXTRACTION,  
 };
 
+
+// TODO(Sigull): Thinking about having an ordered queue for ticks. Not just next tick.
+// That was my original idea, but AI did it differently and I kept it.
 typedef struct T_Node {
     T_ID id = -1;
     E_Node_Type type;
@@ -291,6 +345,8 @@ typedef struct T_Node {
     T_Mass mass;
     T_Mass wip;
     T_Mass out;
+
+    T_Chem_Mass chem_mass;
 
     // Cap of a destination stock on this node, checked against the dst
     // T_Mass' live content at enactment time. NOTE for N_CONVEYOR: moves
@@ -313,6 +369,14 @@ typedef struct T_Node {
     
     // N_FLOTATION && N_CRUSHER
     E_Processor_State proc_state = S_NULL;
+
+    // N_CHEM_SRC — the acid tonnage itself is the node's T_Mass blob
+    i64    chem_cars   = 0; // cars per delivery string (set by the scrum)
+    double chem_burned = 0; // consumed
+
+    // N_CHEM_MONTHLY_SCRUM
+    double chem_burned_at_scrum = 0; // chem_burned snapshot at the last scrum
+    i64    chem_last_scrum      = 0; // when the last scrum happened
 
 } T_Node;
 
@@ -370,8 +434,6 @@ i64 g_transaction_count = 0;
 
 // Imported additive stock — its own blob, outside the ore chain (see params).
 T_Mass g_additives;
-
-
 
 T_Transaction* make_transaction(u64 type) {
     assert(g_transaction_count < MAX_TRANSACTIONS, "Increase transaction capacity.");
@@ -461,6 +523,7 @@ static void clear_transactions() {
 // return true only at the end
 static b32 enact_transaction(T_ID id) {
     T_Transaction* t = get_transaction(id);
+    if (t == NULL) return false; // Already successfully processed before.
 
     // MOVE BLOB OF MATERIALS BETWEEN NODES.
     if(t->type & T_MOVE) {
@@ -576,12 +639,38 @@ static b32 enact_transaction(T_ID id) {
 T_Node* init_node(E_Node_Type type) {
     assert(g_node_count < MAX_NODE_COUNT, "Too many nodes. Increase MAX_NODE_COUNT.");
 
+    // // Handled check, just debug.
+    // // Add case when handled.
+    // switch(type) {
+    //     case N_MINER:
+    //     case N_CHEM_SRC:
+    //     case N_CHEM_DISRUPTION:
+    //     case N_CHEM_MONTHLY_SCRUM:
+    //     case N_ADDITIVE_SRC:
+    //     case N_TRUCK:
+    //     case N_CRUSHER:
+    //     case N_CONVEYOR:
+    //     case N_FLOTATION:
+    //     case N_TAILINGS:
+    //         break;
+    //     default:
+    //         assert(false, "Unhandled node type!");
+    // }
+
     T_Node* n = &g_nodes[g_node_count];
-    
+
     n->id = g_node_count++;
     n->type = type;
     n->next_tick = -1;
     
+    if (type == N_MINER) {
+        n->next_tick = (i64)g_w.exponential(ARRIVAL_MEAN);
+    }
+
+    if (type == N_CHEM_DISRUPTION) {
+        n->next_tick = (i64)g_w.exponential(CHEM_EVENT_MEAN);
+    }
+
     // Transfer nodes
     if (type == N_CONVEYOR || type == N_TRUCK) {
         g_transfer_nodes[g_transfer_node_count++] = n->id;
@@ -594,6 +683,15 @@ T_Node* init_node(E_Node_Type type) {
     // Nodes with state, which can be woken up by getting a transfer.
     if (type == N_CRUSHER || type == N_FLOTATION) {
         n->proc_state = S_IDLE;
+    }
+
+    if (type == N_CHEM_SRC) {
+        n->mass_capacity = CHEM_TANK_CAP;
+        n->next_tick = 1 * DAY;
+    }
+
+    if (type == N_CHEM_MONTHLY_SCRUM) {
+        n->next_tick = 1 * DAY;
     }
 
     return n;
@@ -659,6 +757,58 @@ void tick(T_ID id) {
 
             // TODO(Sigull): Maybe add slower modulation, but like this is overcooking.
             n->next_tick = g_w.time + g_w.exponential(ARRIVAL_MEAN / speed);
+        } break;
+
+        
+        case N_CHEM_DISRUPTION:
+        {
+            double len = (double)CHEM_DISRUPT_MEDIAN *
+                         std::exp(CHEM_DISRUPT_SIGMA * g_w.normal_distribution(0.0, 1.0));
+            g_w.chem_disrupted_until = g_w.time + (i64)len;
+
+            n->next_tick = g_w.time + (i64)g_w.exponential(CHEM_EVENT_MEAN);
+        } break;
+
+        
+        case N_CHEM_MONTHLY_SCRUM:
+        {
+            T_Node* src = get_node(n->input);
+
+            double window = std::max(1.0, (double)(g_w.time - n->chem_last_scrum));
+            double burn = (src->chem_burned - n->chem_burned_at_scrum) * DAY / window;
+            double want = burn + (CHEM_TARGET - src->chem_mass.chem) / CHEM_CATCHUP_DAYS;
+
+            i64 cars = (i64)std::llround(want * ((double)CHEM_DELIVERY_PERIOD / DAY) / CHEM_LOT_TONS);
+            i64 lo   = (want > 0.0) ? 1 : 0; // a live contract ships at least one car
+            src->chem_cars = std::clamp(cars, lo, CHEM_MAX_CARS);
+
+            n->chem_burned_at_scrum = src->chem_burned;
+            n->chem_last_scrum = g_w.time;
+            n->next_tick = g_w.time + CHEM_SCRUM_PERIOD;
+        } break;
+
+
+        case N_CHEM_SRC:
+        {
+            if (g_w.time < g_w.chem_disrupted_until) {
+                n->next_tick = g_w.chem_disrupted_until;
+                break;
+            }
+
+            if (n->chem_cars <= 0) {
+                n->next_tick = g_w.time + CHEM_DELIVERY_PERIOD;
+                break;
+            }
+
+            double tons = n->chem_cars * CHEM_LOT_TONS;
+            if (n->chem_mass.chem + tons > n->mass_capacity) {
+                // TODO(Sigull): AI handled this like fking shit.
+                n->next_tick = g_w.time + CHEM_DELIVERY_PERIOD;
+                break;
+            }
+
+            n->chem_mass.chem += tons;
+            n->next_tick = g_w.time + CHEM_DELIVERY_PERIOD;
         } break;
 
 
@@ -876,9 +1026,6 @@ int main(void) {
     link_nodes(crusher->id, belt->id);
     link_nodes(belt->id,    flot->id);
     link_nodes(flot->id,    dam->id); // reject stream; product waits in flot->out
-
-    // Prime the only exogenous clock; everything else wakes via the sweep.
-    miner->next_tick = (i64)g_w.exponential(ARRIVAL_MEAN);
 
     i64 next_report = 30 * DAY;
     while (g_w.time < g_w.END) {

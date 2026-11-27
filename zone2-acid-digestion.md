@@ -2,7 +2,9 @@
 
 Two objects:
 
-- **CHEM_SUP** — an inventory process (one consumable reagent, H₂SO₄).
+- **CHEM_SUP** — a contracted delivery stream for one consumable reagent
+  (H₂SO₄): scheduled arrivals, occasionally suspended by market/logistics
+  events.
 - **DIGEST** — a batch server with a *resource precondition* (needs feed **and**
   reagent to start) whose completion applies a mass map and splits output into
   two streams.
@@ -47,38 +49,71 @@ Real numbers [M, unless marked W=web-verified]:
 | residue | 0.6–0.8 t / t concentrate, Th-bearing |
 | acid logistics | ~85 t per rail car [W]; tank farm = days–weeks of cover; deliveries slip right-skewed |
 
-Acid is bought as a bulk commodity through a standing reorder loop — a slipped
-train means the front end freezes while the SX cascade keeps drinking the PLS
-tank. That is the assignment's "delayed chemical deliveries" scenario, and it
-lives entirely in these two objects.
+Acid is not "ordered" — it arrives under a standing contract on a fixed
+schedule of rail cars / tanker trucks into a tank farm holding days–weeks of
+cover; occasionally the market or the railway suspends the stream (the
+2022–23 global acid crunch is the canonical example) and the front end
+freezes while the SX cascade keeps drinking the PLS tank. That is the
+assignment's "delayed chemical deliveries" scenario, and it lives entirely
+in these two objects.
 
 ---
 
-## 2. CHEM_SUP — inventory process
+## 2. CHEM_SUP — regular contracted deliveries + a planning loop
+
+Two timescales over one stream:
+
+- **The stream is regular.** Fixed car size, steady cadence. How much arrives
+  per week is a *planning decision*, not a reflex.
+- **Planning (slow loop).** Monthly, procurement looks at trailing burn and
+  the tank level and adjusts the contracted rate within the contract's flex
+  band: "we're low → more per week, from next month on."
+- **Disruptions (exogenous).** Market/logistics events suspend the stream for
+  days–weeks; planning can't prevent them, only absorb them.
 
 ```
 state:
-    stock          # t H2SO4 in the tank farm
-    on_order       # bool
-    arrival_time   # time the outstanding order lands
+    stock             # t H2SO4 in the tank farm
+    next_due          # next contracted delivery
+    planned_rate      # t/day the contract delivers — the planning decision
+    next_review       # monthly procurement review
+    disrupted_until   # end of active supply event (-inf = none)
+    next_event        # next disruption onset
 
-on delivery  (t == arrival_time):
-    stock += LOT                        # 350 t
-    on_order = false
+on delivery (t == next_due):
+    if t < disrupted_until:              # event active: car slipped
+        next_due = disrupted_until       # stream resumes at recovery
+    else if stock + LOT > TANK_CAP:      # tank full: car waits in the siding
+        next_due += LOT / planned_rate
+    else:
+        stock    += LOT                  # 85 t, one rail car [W]
+        next_due  = t + LOT / planned_rate
 
-on daily review:
-    if not on_order and stock <= REORDER_POINT:   # 300 t ≈ 9 d of cover
-        on_order  = true
-        arrival_time = t + LogNormal(median = 4 d, sigma = 0.5)
+on monthly review (t == next_review):
+    burn30 = acid burned over trailing 30 d / 30         # trailing actual
+    want   = burn30 + (TARGET - stock) / CATCHUP_TIME    # close the deficit
+    planned_rate = clamp(want, 0.8 * burn30, 1.25 * burn30)  # flex band
+    next_review = t + 30 d
+    # the new rate governs deliveries from here on; add an explicit ~3-week
+    # negotiation lag if you want the full S&OP inertia
+
+on disruption onset (t == next_event):
+    disrupted_until = t + LogNormal(median = 6 d, sigma = 0.6)
+    next_event      = t + Exponential(mean = 120 d)
 
 consumption:
     DIGEST subtracts from stock when it charges a campaign
 ```
 
-**Reality:** the purchasing agent checks the tank gauge daily; at ~9 days of
-cover a 350 t order goes out; the train comes when it comes — usually ~4 days,
-occasionally 10+ (lognormal tail: supplier allocation, rail, market tightness).
-Nothing in the plant is in this loop; the plant only sees the tank level.
+**Reality:** a plant burning 33 t/day receives one 85 t rail car every ~2.5
+days — that regular stream is the contract. The monthly review is the S&OP
+loop: real acid contracts are annual take-or-pay volumes with a ±15–25 %
+flex band; a sustained shortage is answered by renegotiating the band, which
+takes review + negotiation + catch-up ≈ **~2 months** — the "can't respond
+quickly" property extends to reagents. The deficit term also ramps the
+contract with the plant (trailing burn ≈ 0 during náběh) and speeds recovery
+after a stockout, capped by the band. Disruptions (2022–23 acid squeeze:
+allocations, ~3× price) are what the band and the tank farm exist to absorb.
 
 ---
 
@@ -162,8 +197,10 @@ Stuck states and their rescuers (this is the complete state machine):
 | r | Tri(0.90, 0.945, 0.98) | leach recoveries |
 | PLS_CAP | 30 t REO | ~2 days of cascade feed |
 | feed cap | 40 t | surge before the kiln |
-| acid: LOT / reorder / tank | 350 / 300 / 650 t | ~10.5 d per lot; cap > reorder + lot ⇒ no clamping |
-| lead | LogNorm(4 d, 0.5) | P95 ≈ 10.7 d |
+| acid: LOT / planned rate | 85 t / 33.4 t/day | one rail car [W]; nominal cadence 2.55 d |
+| planning | review 30 d, catch-up 30 d, flex 0.8–1.25× burn | S&OP loop; contract tolerance band |
+| tank / target | 400 / 200 t | ~6 d of cover at target |
+| disruption | onset Exp(120 d), length LogNorm(6 d, σ 0.6) | a few market/logistics events per year |
 
 ## 5. Sanity checks
 
@@ -171,8 +208,13 @@ Stuck states and their rescuers (this is the complete state machine):
   t/h (≈ 0.78 t/t concentrate ✓ §1), acid burn 33 t/day.
 - Conservation per element: campaign REO = PLS REO + residue REO, exact by the
   map. Acid: deliveries = consumed + Δstock.
-- Acid sawtooth: order at 300 t, 4 d lead burns 134 t → lands at 166, +350 → 516.
-  Stockout needs lead > 9 d ≈ 5 % of orders ≈ one event / 7 months, 1–4 days long.
+- Acid stock: regular ~2.55 d sawtooth (amplitude 85 t) around the 200 t
+  target; the planning loop holds it there (rate = burn + deficit/30 d, flex
+  ≤ 1.25×). Stockouts: a median 6 d event defers ~1.4 cars (120 t) — the tank
+  at ~200 t runs (nearly) dry exactly as the stream resumes; a P90 event
+  (~13 d) defers ~4 cars → dry after ~6 d → ~7 d frozen front end, then ~1
+  month of lean recovery (catch-up capped at +25 %). ~15 events / 5 yr,
+  roughly a third bite. Response to any sustained change ≈ 2 months.
 - Delay experiment, spread speeds: tank dry → digest freezes → PLS (30 t)
   empties in **~2 days** (cascade starves); feed + Q_CONC (192 t) absorb
   **~6.9 days** before flotation blocks; recovery at 1.6 − 1.16 t/h, i.e.
