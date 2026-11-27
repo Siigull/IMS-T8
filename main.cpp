@@ -852,8 +852,7 @@ void tick(T_ID id) {
                     n->proc_state = S_FINISH;
                     n->next_tick = g_w.time + (i64)std::llround(tons / rate * HOUR);
                 }
-            } 
-
+            }
         } break;
 
 

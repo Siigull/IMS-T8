@@ -64,14 +64,6 @@ static std::string fmt_dur(i64 t) {
     else                        snprintf(buf, sizeof buf, "-");
     return buf;
 }
-static std::string fmt_tons(double v) {
-    char buf[48];
-    if (v >= 100000) snprintf(buf, sizeof buf, "%.0f t", v);
-    else if (v >= 100) snprintf(buf, sizeof buf, "%.1f t", v);
-    else snprintf(buf, sizeof buf, "%.2f t", v);
-    return buf;
-}
-
 // ============================================================================
 //                                  theme
 // ============================================================================
@@ -467,6 +459,7 @@ static struct UIState {
     int    reload_request = 0;
     int    k = 0;                    // current tick index
     int    s24_k = -3;               // 24h-ago cache (table), -3 = invalid
+    float  insp_scroll = 0, insp_h = 0;
     NodeState s24[TRACE_MAX_NODES];
     std::vector<size_t> inflow_cursor;   // per-node event cursors (particles)
 } UI;
@@ -478,7 +471,8 @@ static const char* SPEED_NAMES[] = { "1 h/s", "6 h/s", "1 d/s", "7 d/s", "30 d/s
 //                                  fonts
 // ============================================================================
 
-static Font F13, F16, F20, F28, FB16, FB20;
+struct Fnt { Font f; float sz; };
+static Fnt F13, F16, F20, FB16, FB20;
 
 static void load_fonts() {
     const char* mono[] = {
@@ -492,27 +486,78 @@ static void load_fonts() {
     const char* mp = nullptr, *bp = nullptr;
     for (int i = 0; mono[i]; i++) if (FileExists(mono[i])) { mp = mono[i]; break; }
     for (int i = 0; bold[i]; i++) if (FileExists(bold[i])) { bp = bold[i]; break; }
-    if (!mp) { F13 = F16 = F20 = F28 = GetFontDefault(); FB16 = FB20 = GetFontDefault(); return; }
-    F13 = LoadFontEx(mp, 26, nullptr, 0);  SetTextureFilter(F13.texture, TEXTURE_FILTER_BILINEAR);
-    F16 = LoadFontEx(mp, 32, nullptr, 0);  SetTextureFilter(F16.texture, TEXTURE_FILTER_BILINEAR);
-    F20 = LoadFontEx(mp, 40, nullptr, 0);  SetTextureFilter(F20.texture, TEXTURE_FILTER_BILINEAR);
-    F28 = LoadFontEx(mp, 56, nullptr, 0);  SetTextureFilter(F28.texture, TEXTURE_FILTER_BILINEAR);
+    if (!mp) {
+        Font d = GetFontDefault();
+        F13 = { d, 10 }; F16 = { d, 10 }; F20 = { d, 10 }; FB16 = { d, 10 }; FB20 = { d, 10 };
+        return;
+    }
+
+    // ASCII + the few extra glyphs the UI uses (· — – … ‹ › arrows Δ τ ± °)
+    int cps[128]; int n = 0;
+    for (int c = 32; c <= 126; c++) cps[n++] = c;
+    int extra[] = { 0xB7, 0xB0, 0xB1, 0x2013, 0x2014, 0x2026, 0x2039, 0x203A,
+                    0x2190, 0x2191, 0x2192, 0x2193, 0x0394, 0x03C4, 0x2264, 0x2265 };
+    for (int c : extra) cps[n++] = c;
+
+    F13 = { LoadFontEx(mp, 26, cps, n), 13 };  SetTextureFilter(F13.f.texture, TEXTURE_FILTER_BILINEAR);
+    F16 = { LoadFontEx(mp, 32, cps, n), 16 };  SetTextureFilter(F16.f.texture, TEXTURE_FILTER_BILINEAR);
+    F20 = { LoadFontEx(mp, 40, cps, n), 20 };  SetTextureFilter(F20.f.texture, TEXTURE_FILTER_BILINEAR);
     if (bp) {
-        FB16 = LoadFontEx(bp, 32, nullptr, 0); SetTextureFilter(FB16.texture, TEXTURE_FILTER_BILINEAR);
-        FB20 = LoadFontEx(bp, 40, nullptr, 0); SetTextureFilter(FB20.texture, TEXTURE_FILTER_BILINEAR);
+        FB16 = { LoadFontEx(bp, 32, cps, n), 16 }; SetTextureFilter(FB16.f.texture, TEXTURE_FILTER_BILINEAR);
+        FB20 = { LoadFontEx(bp, 40, cps, n), 20 }; SetTextureFilter(FB20.f.texture, TEXTURE_FILTER_BILINEAR);
     } else FB16 = F16, FB20 = F20;
 }
 
-static void text(Font f, float x, float y, const char* s, Color c) {
-    DrawTextEx(f, s, { x, y }, (float)f.baseSize, 0, c);
+static void text(Fnt f, float x, float y, const char* s, Color c) {
+    DrawTextEx(f.f, s, { x, y }, f.sz, 0, c);
 }
-static Vector2 measure(Font f, const char* s) { return MeasureTextEx(f, s, (float)f.baseSize, 0); }
+static Vector2 measure(Fnt f, const char* s) { return MeasureTextEx(f.f, s, f.sz, 0); }
+
+// draw text, truncated with "..." if wider than maxw
+static void text_trunc(Fnt f, float x, float y, const char* s, Color c, float maxw) {
+    Vector2 ts = measure(f, s);
+    if (ts.x <= maxw) { text(f, x, y, s, c); return; }
+    char buf[128];
+    int lo = 0, hi = (int)strlen(s);
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        snprintf(buf, sizeof buf, "%.*s...", mid, s);
+        if (measure(f, buf).x > maxw) hi = mid; else lo = mid + 1;
+    }
+    snprintf(buf, sizeof buf, "%.*s...", std::max(0, lo - 1), s);
+    text(f, x, y, buf, c);
+}
+
+// right-aligned text
+static void text_r(Fnt f, float xr, float y, const char* s, Color c) {
+    text(f, xr - measure(f, s).x, y, s, c);
+}
+
+// tonnage with thousands separators: "541,347 t"
+static std::string fmt_tons2(double v, const char* unit = " t") {
+    char buf[48];
+    if (v >= 100) {
+        long long iv = (long long)llround(v);
+        char tmp[32]; snprintf(tmp, sizeof tmp, "%lld", iv);
+        int tl = (int)strlen(tmp), oi = 0;
+        for (int i = 0; i < tl; i++) {
+            buf[oi++] = tmp[i];
+            int rem = tl - 1 - i;
+            if (rem > 0 && rem % 3 == 0) buf[oi++] = ',';
+        }
+        buf[oi] = 0;
+        snprintf(buf + oi, sizeof buf - oi, "%s", unit);
+    } else if (v >= 1) snprintf(buf, sizeof buf, "%.1f%s", v, unit);
+    else if (v > 0.005) snprintf(buf, sizeof buf, "%.2f%s", v, unit);
+    else snprintf(buf, sizeof buf, "-%s", unit);
+    return buf;
+}
 
 // ============================================================================
 //                                widgets
 // ============================================================================
 
-static bool button(Rectangle r, const char* label, Font f) {
+static bool button(Rectangle r, const char* label, Fnt f) {
     bool h = CheckCollisionPointRec(UI.mouse, r);
     DrawRectangleRec(r, h ? COL_PANEL2 : COL_PANEL);
     DrawRectangleLinesEx(r, 1, h ? COL_ACCENT : COL_BORDER);
@@ -521,12 +566,38 @@ static bool button(Rectangle r, const char* label, Font f) {
     return h && IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
 }
 
+// transport icon button with drawn glyphs
+static bool icon_button(Rectangle r, int kind, bool h) {
+    DrawRectangleRec(r, h ? COL_PANEL2 : COL_PANEL);
+    DrawRectangleLinesEx(r, 1, h ? COL_ACCENT : COL_BORDER);
+    Color c = h ? COL_TEXT : COL_DIM;
+    float cx = r.x + r.width / 2, cy = r.y + r.height / 2, s = 6;
+    auto tri = [&](float dx, float ss, Color cc) {
+        DrawTriangle({ cx + dx + ss, cy - ss }, { cx + dx - ss * 0.6f, cy }, { cx + dx + ss, cy + ss }, cc);
+    };
+    switch (kind) {
+        case 0:  // to start |<
+            DrawRectangle(cx - 10, cy - 6, 3, 12, c); tri(-1, s, c); break;
+        case 1:  // prev tick  |<
+            DrawRectangle(cx - 3, cy - 5, 2.5f, 10, Fade(c, 0.45f)); tri(4, 4.5f, c); break;
+        case 2:  // play
+            DrawTriangle({ cx - s + 2, cy - s + 1 }, { cx - s + 2, cy + s - 1 }, { cx + s + 3, cy }, c); break;
+        case 3:  // pause
+            DrawRectangle(cx - 6, cy - 7, 4, 14, c); DrawRectangle(cx + 2, cy - 7, 4, 14, c); break;
+        case 4:  // next tick  >|
+            tri(-4, 4.5f, c); DrawRectangle(cx + 2, cy - 5, 2.5f, 10, Fade(c, 0.45f)); break;
+        case 5:  // to end >|
+            tri(1, s, c); DrawRectangle(cx + 8, cy - 6, 3, 12, c); break;
+    }
+    return h && IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+}
+
 static void draw_tooltip() {
     if (!UI.tooltip[0]) return;
     const float pad = 8;
     int lines = 1;
     for (const char* c = UI.tooltip; *c; c++) if (*c == '\n') lines++;
-    float w = 0, h = lines * (F13.baseSize + 3);
+    float w = 0, h = lines * (F13.sz + 3);
     char buf[1024]; strncpy(buf, UI.tooltip, 1023); buf[1023] = 0;
     for (char* line = strtok(buf, "\n"); line; line = strtok(nullptr, "\n")) {
         Vector2 ts = measure(F13, line);
@@ -541,7 +612,31 @@ static void draw_tooltip() {
     strncpy(buf, UI.tooltip, 1023); buf[1023] = 0;
     float yy = y + pad - 2;
     for (char* line = strtok(buf, "\n"); line; line = strtok(nullptr, "\n")) {
-        text(F13, x + pad, yy, line, COL_TEXT); yy += F13.baseSize + 3;
+        text(F13, x + pad, yy, line, COL_TEXT); yy += F13.sz + 3;
+    }
+}
+
+// small status chip; returns width
+static float chip(float x, float y, const char* s, Color c, Fnt f = F13) {
+    Vector2 ts = measure(f, s);
+    float w = ts.x + 12;
+    float chh = f.sz + 6;
+    DrawRectangle(x, y, w, chh, Fade(c, 0.16f));
+    DrawRectangleLinesEx({ x, y, w, chh }, 1, Fade(c, 0.45f));
+    text(f, x + 6, y + (chh - f.sz) / 2 - 1, s, c);
+    return w;
+}
+
+// label-left / value-right stat line with a thin bar track underneath
+static void stat_line(float x, float y, float w, const char* label, const char* value,
+                      Color vc, double bar_v, double bar_cap, Color bar_c) {
+    text(F13, x, y, label, COL_FAINT);
+    text_r(F13, x + w, y + 1, value, vc);
+    float by = y + F13.sz + 2;
+    DrawRectangle(x, by, w, 3, COL_PANEL2);
+    if (bar_v > 0 && bar_cap > 0) {
+        double u = clampd(bar_v / bar_cap, 0, 1);
+        DrawRectangle(x, by, (float)(w * u), 3, Fade(bar_c, 0.55f));
     }
 }
 
@@ -550,8 +645,10 @@ static void draw_tooltip() {
 // ============================================================================
 
 struct Layout {
-    float top_bar_h = 52, timeline_h = 170, table_h = 176, inspector_w = 430;
+    float top_bar_h = 54, timeline_h = 178, table_h = 190, inspector_w = 440;
     Rectangle timeline{}, graph{}, inspector{}, table{};
+    Rectangle tl_minimap{ -1,-1,-1,-1 };
+    bool screenshot_mode = false;
     void compute() {
         float W = GetScreenWidth(), H = GetScreenHeight();
         timeline  = { 0, top_bar_h, W, timeline_h };
@@ -563,6 +660,8 @@ struct Layout {
     }
 } LY;
 
+// node cards are drawn at a FIXED pixel size; camera zoom only spreads
+// their positions apart. Keeps text inside cards at every zoom.
 static Vector2 world_to_screen(Vector2 w) {
     Vector2 c = { LY.graph.x + LY.graph.width * 0.5f, LY.graph.y + LY.graph.height * 0.5f };
     return { (w.x - UI.cam.x) * UI.zoom + c.x, (w.y - UI.cam.y) * UI.zoom + c.y };
@@ -580,23 +679,26 @@ static void default_layout() {
     for (size_t i = 0; i < TR.nodes.size(); i++) {
         Node& n = TR.nodes[i];
         const char* name = n.info.name;
-        n.size = { 176, 100 };
-        if (n.info.type == T_CONVEYOR)  n.size = { 244, 88 };
-        if (n.info.type == T_TAILINGS)  n.size = { 176, 122 };
-        if (n.info.type == TRACE_NODE_ADDITIVE_STOCK) n.size = { 168, 66 };
-        if      (!strcmp(name, "Mine"))           n.pos = { 30, 300 };
-        else if (!strcmp(name, "Haul truck"))     n.pos = { 255, 328 }, n.size = { 120, 46 };
-        else if (!strcmp(name, "Crusher"))        n.pos = { 480, 300 };
-        else if (!strcmp(name, "Belt conveyor"))  n.pos = { 715, 306 };
-        else if (!strcmp(name, "Flotation"))      n.pos = { 1020, 296 };
-        else if (!strcmp(name, "Tailings dam"))   n.pos = { 1270, 286 };
-        else if (!strcmp(name, "Chem market"))    n.pos = { 490, 40 };
-        else if (!strcmp(name, "Acid supplier"))  n.pos = { 130, 110 };
-        else if (!strcmp(name, "Acid S&OP"))      n.pos = { 380, 126 };
-        else if (!strcmp(name, "Additive stock")) n.pos = { 800, 46 };
+        n.size = { 200, 110 };
+        if (n.info.type == T_CONVEYOR)  n.size = { 252, 106 };
+        if (n.info.type == T_FLOTATION) n.size = { 210, 150 };
+        if (n.info.type == T_TAILINGS)  n.size = { 200, 156 };
+        if (n.info.type == T_CHEM_SRC)  n.size = { 232, 132 };
+        if (n.info.type == T_CHEM_DISRUPTION) n.size = { 208, 74 };
+        if (n.info.type == TRACE_NODE_ADDITIVE_STOCK) n.size = { 208, 74 };
+        if      (!strcmp(name, "Mine"))           n.pos = { 40, 330 };
+        else if (!strcmp(name, "Haul truck"))     n.pos = { 250, 470 };
+        else if (!strcmp(name, "Crusher"))       n.pos = { 430, 330 };
+        else if (!strcmp(name, "Belt conveyor"))  n.pos = { 720, 342 };
+        else if (!strcmp(name, "Flotation"))      n.pos = { 1050, 312 };
+        else if (!strcmp(name, "Tailings dam"))   n.pos = { 1350, 302 };
+        else if (!strcmp(name, "Chem market"))    n.pos = { 470, 30 };
+        else if (!strcmp(name, "Acid supplier"))  n.pos = { 50, 110 };
+        else if (!strcmp(name, "Acid S&OP"))      n.pos = { 420, 116 };
+        else if (!strcmp(name, "Additive stock")) n.pos = { 800, 30 };
         else {  // unknown node: auto grid on the right
-            int col = (int)i % 3, row = (int)i / 3;
-            n.pos = { 1560.f + col * 210, 60.f + row * 140 };
+            int col = (int)i % 2, row = (int)i / 2;
+            n.pos = { 1620.f + col * 230, 60.f + row * 170 };
         }
         if (n.info.type == T_TRUCK) n.draggable = false;
     }
@@ -605,10 +707,16 @@ static void default_layout() {
         minx = std::min(minx, n.pos.x); miny = std::min(miny, n.pos.y);
         maxx = std::max(maxx, n.pos.x + n.size.x); maxy = std::max(maxy, n.pos.y + n.size.y);
     }
-    float w = maxx - minx + 160, h = maxy - miny + 160;
-    float zx = LY.graph.width / w, zy = LY.graph.height / h;
-    UI.zoom_t = UI.zoom = std::min(zx, zy);
+    float w = maxx - minx + 90, h = maxy - miny + 90;
+    float fit = std::min(LY.graph.width / w, LY.graph.height / h);
+    UI.zoom_t = UI.zoom = clampd(fit, 0.75f, 1.0f);
     UI.cam_t = UI.cam = { (minx + maxx) / 2, (miny + maxy) / 2 };
+}
+
+static Rectangle node_rect(int n) {
+    Node& nd = TR.nodes[n];
+    Vector2 s = world_to_screen(nd.pos);
+    return { s.x, s.y, nd.size.x, nd.size.y };     // fixed size, no zoom scaling
 }
 
 // ============================================================================
@@ -646,16 +754,8 @@ static const char* truck_name(uint8_t s) {
 }
 static const char* conv_name(uint8_t s)  { return s == 0 ? "MOVING" : "LOADING"; }
 
-static void draw_bar(float x, float y, float w, float h, double v, double cap, Color c, const char* label) {
-    DrawRectangle(x, y, w, h, COL_PANEL2);
-    double u = (cap > 0 && std::isfinite(cap)) ? v / cap : (v > 0 ? 1 : 0);
-    u = clampd(u, 0, 1);
-    if (v > 0) DrawRectangle(x + 1, y + 1, (float)((w - 2) * u), h - 2, Fade(c, 0.85f));
-    Vector2 ts = measure(F13, label);
-    text(F13, x + 5, y + (h - ts.y) / 2, label, COL_TEXT);
-}
-
-static void draw_elem_bar(float x, float y, float w, float h, const float vals[6]) {
+static void draw_elem_bar(float x, float y, float w, float h, const float* vals) {
+    if (!vals) { DrawRectangle(x, y, w, h, COL_PANEL2); return; }
     double tot = 0; for (int e = 0; e < 6; e++) tot += vals[e];
     if (tot <= 0) { DrawRectangle(x, y, w, h, COL_PANEL2); return; }
     float cx = x;
@@ -666,131 +766,231 @@ static void draw_elem_bar(float x, float y, float w, float h, const float vals[6
     }
 }
 
-// node screen rectangle
-static Rectangle node_rect(int n) {
-    Node& nd = TR.nodes[n];
-    Vector2 s = world_to_screen(nd.pos);
-    return { s.x, s.y, nd.size.x * UI.zoom, nd.size.y * UI.zoom };
+// the haul truck road: from under the mine to under the crusher
+static void road_endpoints(int mine, int crusher, Vector2* a, Vector2* b, float* y) {
+    Rectangle ma = node_rect(mine), ca = node_rect(crusher);
+    *a = { ma.x + ma.width * 0.45f, ma.y + ma.height };
+    *b = { ca.x + ca.width * 0.45f, ca.y + ca.height };
+    *y = std::max(a->y, b->y) + 46;
+}
+
+static Vector2 truck_pos(int truck) {
+    Node& nd = TR.nodes[truck];
+    NodeState& st = FR.st[truck];
+    i64 t_change = TR.ticks[0];
+    for (auto& sc : nd.state_changes)
+        if (sc.field == 1 && sc.t <= UI.t) t_change = sc.t;
+    double u = clampd((UI.t - t_change) / (double)MS_HOUR, 0, 1);
+    double prog;
+    if (st.truck_state == 2) prog = u;
+    else if (st.truck_state == 3) prog = 1 - u;
+    else if (st.truck_state == 1) prog = 1.0;
+    else prog = 0.0;
+    int mine = -1, crusher = -1;
+    for (size_t i = 0; i < TR.nodes.size(); i++) {
+        if (TR.nodes[i].info.type == T_MINER) mine = (int)i;
+        if (TR.nodes[i].info.type == T_CRUSHER) crusher = (int)i;
+    }
+    if (mine < 0 || crusher < 0) return world_to_screen(nd.pos);
+    Vector2 a, b; float ry;
+    road_endpoints(mine, crusher, &a, &b, &ry);
+    return { (float)lerpd((double)a.x, (double)b.x, prog), ry };
+}
+
+static void draw_road(int mine, int crusher) {
+    Vector2 a, b; float ry;
+    road_endpoints(mine, crusher, &a, &b, &ry);
+    // drop from mine bottom, run along, rise into crusher bottom
+    Vector2 p0 = { a.x, a.y + 6 }, p1 = { a.x, ry }, p2 = { b.x, ry }, p3 = { b.x, b.y + 6 };
+    Color rc = { 52, 60, 71, 255 };
+    DrawLineEx(p0, p1, 3, rc); DrawLineEx(p1, p2, 3, rc); DrawLineEx(p2, p3, 3, rc);
+    // direction chevrons
+    for (float x = p1.x + 14; x < p2.x - 16; x += 34) {
+        DrawTriangle({ x, ry - 6 }, { x, ry + 6 }, { x + 9, ry }, Fade(COL_FAINT, 0.5f));
+    }
+    // dock stubs into the cards
+    DrawLineEx({ a.x - 5, a.y + 6 }, { a.x + 5, a.y + 6 }, 3, rc);
+    DrawLineEx({ b.x - 5, b.y + 6 }, { b.x + 5, b.y + 6 }, 3, rc);
+}
+
+static void draw_truck(int truck) {
+    Node& nd = TR.nodes[truck];
+    NodeState& st = FR.st[truck];
+    Vector2 tp = truck_pos(truck);
+
+    Rectangle body = { tp.x - 21, tp.y - 15, 42, 22 };
+    bool sel = UI.sel == truck, hov = UI.hover == truck;
+    DrawRectangleRec(body, COL_PANEL);
+    DrawRectangleLinesEx(body, 1.5f, sel ? COL_PLAYHEAD : (hov ? COL_ACCENT : nd.color));
+    double load = clampd(st.mass_t() / 100.0, 0, 1);
+    if (load > 0.01) DrawRectangle(body.x + 3, body.y + 3 + (body.height - 6) * (1 - (float)load),
+                                   body.width - 6, (body.height - 6) * (float)load, Fade(nd.color, 0.65f));
+    DrawRectangle(tp.x + 19, tp.y - 8, 12, 15, Fade(nd.color, 0.9f));       // cab
+    DrawCircle(tp.x - 11, tp.y + 8, 4, COL_FAINT);
+    DrawCircle(tp.x + 11, tp.y + 8, 4, COL_FAINT);
+    DrawCircle(tp.x - 11, tp.y + 8, 1.6f, COL_BG);
+    DrawCircle(tp.x + 11, tp.y + 8, 1.6f, COL_BG);
+
+    // status bubble above the road, clamped to not hit the cards
+    char b[64];
+    snprintf(b, sizeof b, "%s  %.0f t", truck_name(st.truck_state), st.mass_t());
+    Vector2 ts = measure(F13, b);
+    float bx = clampd(tp.x - (ts.x + 12) / 2, LY.graph.x + 4, LY.graph.x + LY.graph.width - ts.x - 16);
+    float by = tp.y - 40;
+    DrawRectangle(bx, by, ts.x + 12, 18, { 16, 21, 28, 235 });
+    DrawRectangleLinesEx({ bx, by, ts.x + 12, 18 }, 1, sel ? COL_PLAYHEAD : COL_BORDER);
+    text(F13, bx + 6, by + 2, b, COL_TEXT);
 }
 
 static void draw_node(int n) {
     Node& nd = TR.nodes[n];
     NodeState& st = FR.st[n];
     Rectangle r = node_rect(n);
-    float z = UI.zoom;
+    char b[96];
 
-    DrawRectangleRounded({ r.x + 3, r.y + 4, r.width, r.height }, 0.12f, 4, Fade(BLACK, 0.35f));
-    DrawRectangleRounded(r, 0.12f, 4, COL_PANEL);
+    DrawRectangleRounded(r, 0.09f, 6, COL_PANEL);
     if (UI.sel == n) {
         float pulse = 0.5f + 0.5f * sinf((float)GetTime() * 4.0f);
-        DrawRectangleRoundedLinesEx(r, 0.12f, 4, 2.5f, Fade(COL_PLAYHEAD, 0.55f + 0.45f * pulse));
+        DrawRectangleRoundedLinesEx(r, 0.09f, 6, 2.0f, Fade(COL_PLAYHEAD, 0.6f + 0.4f * pulse));
     } else {
-        DrawRectangleRoundedLinesEx(r, 0.12f, 4, 1.5f, UI.hover == n ? COL_ACCENT : COL_BORDER);
+        DrawRectangleRoundedLinesEx(r, 0.09f, 6, 1.2f, UI.hover == n ? COL_ACCENT : COL_BORDER);
     }
 
-    float th = 24 * z;
-    DrawRectangleRounded({ r.x, r.y, r.width, th }, 0.12f, 4, Fade(nd.color, 0.16f));
-    DrawCircle(r.x + 10 * z, r.y + th / 2, 4 * z, nd.color);
-    text(FB16, r.x + 20 * z, r.y + (th - FB16.baseSize) / 2, nd.info.name, COL_TEXT);
-
-    const char* chip = nullptr; Color chip_c = COL_DIM;
+    // title row
+    float th = 26;
+    DrawRectangleRounded({ r.x, r.y, r.width, th + 6 }, 0.09f, 6, Fade(nd.color, 0.13f));
+    DrawRectangle(r.x, r.y + th, r.width, 4, COL_PANEL);   // square off the bottom of the strip
+    DrawCircle(r.x + 13, r.y + th / 2 + 1, 4, nd.color);
+    float name_w = r.width - 26;
+    const char* chip_s = nullptr; Color chip_c = COL_DIM;
     if (nd.info.type == T_CRUSHER || nd.info.type == T_FLOTATION) {
-        chip = proc_name(st.proc_state);
+        chip_s = proc_name(st.proc_state);
         chip_c = st.proc_state == 2 ? COL_WARN : (st.proc_state == 1 ? COL_DIM : COL_FAINT);
-    } else if (nd.info.type == T_CONVEYOR) {
-        chip = conv_name(st.conv_state);
     } else if (nd.info.type == T_CHEM_DISRUPTION) {
-        chip = st.disrupted_until > UI.t ? "DISRUPTED" : "calm";
+        chip_s = st.disrupted_until > UI.t ? "DISRUPTED" : "calm";
         chip_c = st.disrupted_until > UI.t ? COL_BAD : COL_DIM;
     }
-    if (chip) {
-        Vector2 ts = measure(F13, chip);
-        float cw = ts.x + 12 * z;
-        DrawRectangle(r.x + r.width - cw - 6, r.y + 4, cw, th - 8, Fade(chip_c, 0.18f));
-        text(F13, r.x + r.width - cw, r.y + (th - F13.baseSize) / 2, chip, chip_c);
+    if (chip_s) {
+        float cw = measure(F13, chip_s).x + 14;
+        chip(r.x + r.width - cw - 6, r.y + 5, chip_s, chip_c);
+        name_w = r.width - cw - 30;
     }
+    text_trunc(FB16, r.x + 22, r.y + 5, nd.info.name, COL_TEXT, name_w);
 
-    float y = r.y + th + 6 * z;
-    char b[80];
+    float ix = r.x + 12, iw = r.width - 24, y = r.y + th + 8;
 
     if (nd.info.type == T_CONVEYOR) {
         int cells = nd.info.belt_cells > 0 ? nd.info.belt_cells : 6;
-        float cw = (r.width - 16 * z) / cells;
-        float chh = 24 * z;
+        float cw = (iw - (cells - 1) * 4) / cells;
+        float chh = 30;
+        int head = ((st.belt_head % cells) + cells) % cells;
         for (int c = 0; c < cells; c++) {
-            float cx = r.x + 8 * z + c * cw;
+            float cx = ix + c * (cw + 4);
             double tons = 0; for (int e = 0; e < 6; e++) tons += st.belt(c, e);
-            DrawRectangle(cx + 1, y, cw - 2, chh, COL_PANEL2);
+            DrawRectangle(cx, y, cw, chh, COL_PANEL2);
             double u = clampd(tons / (double)nd.info.mass_capacity, 0, 1);
-            if (tons > 0.01) DrawRectangle(cx + 2, y + 1, (cw - 4) * (float)u, chh - 2, Fade(nd.color, 0.8f));
-            int head = ((st.belt_head % cells) + cells) % cells;
-            if (c == head) DrawRectangleLinesEx({ cx + 1, y - 2, cw - 2, chh + 4 }, 1.5f, COL_PLAYHEAD);
-            if (cw > 40) {
-                snprintf(b, sizeof b, "%.0f", tons);
-                Vector2 ts = measure(F13, b);
-                text(F13, cx + (cw - ts.x) / 2, y + chh + 2, b, COL_DIM);
+            if (tons > 0.01) DrawRectangle(cx + 1, y + chh - 3 - (chh - 6) * (float)u + 1.5f, cw - 2, (chh - 6) * (float)u, Fade(nd.color, 0.7f));
+            if (c == head && tons > 0.01) DrawRectangleLinesEx({ cx - 1, y - 3, cw + 2, chh + 6 }, 1.4f, Fade(COL_PLAYHEAD, 0.8f));
+            snprintf(b, sizeof b, "%.0f", tons);
+            text_r(F13, cx + cw, y + chh + 3, b, tons > 0.01 ? COL_DIM : COL_FAINT);
+        }
+        y += chh + 20;
+        double tot = st.belt_t();
+        if (tot > 0.01) {
+            snprintf(b, sizeof b, "%s", fmt_tons2(tot).c_str());
+            text(F13, ix, y, "belt", COL_FAINT); text_r(F13, ix + iw, y, b, COL_TEXT);
+        } else { text(F13, ix, y, "belt empty", COL_FAINT); }
+    } else if (nd.info.type == T_TAILINGS) {
+        float fh = r.height - th - 20;
+        DrawRectangle(ix, y - 2, iw, fh, COL_PANEL2);
+        double u = clampd(st.mass_t() / 600000.0, 0, 1);
+        if (u > 0.005) DrawRectangle(ix + 2, y - 2 + fh * (1 - (float)u) + 2, iw - 4, fh * (float)u - 4, Fade(nd.color, 0.38f));
+        snprintf(b, sizeof b, "%s", fmt_tons2(st.mass_t()).c_str());
+        text_r(FB20, ix + iw - 10, y + fh / 2 - 12, b, COL_TEXT);
+        text(F13, ix + 8, y + fh / 2 - 10, "dam", COL_FAINT);
+    } else if (nd.info.type == T_CHEM_SRC) {
+        float fh = r.height - th - 20;
+        float tw = 40;
+        // tank on the right, values on the left
+        DrawRectangle(ix + iw - tw, y - 2, tw, fh, COL_PANEL2);
+        double u = clampd(st.chem() / (double)nd.info.mass_capacity, 0, 1);
+        if (u > 0.005) DrawRectangle(ix + iw - tw + 2, y - 2 + fh * (1 - (float)u) + 2, tw - 4, fh * (float)u - 4, Fade(nd.color, 0.6f));
+        // target line at 200/400
+        float ty = y - 2 + fh * (1 - 0.5f);
+        DrawLine(ix + iw - tw, ty, ix + iw, ty, Fade(COL_TEXT, 0.25f));
+        float vw = iw - tw - 14;
+        snprintf(b, sizeof b, "%s", fmt_tons2(st.chem()).c_str());
+        stat_line(ix, y, vw, "tank", b, st.chem() < 50 ? COL_BAD : COL_TEXT, st.chem(), nd.info.mass_capacity, nd.color);
+        snprintf(b, sizeof b, "%.0f t", st.chem_burned);
+        stat_line(ix, y + 26, vw, "burned", b, COL_TEXT, 0, 0, COL_DIM);
+        snprintf(b, sizeof b, "%d cars", st.chem_cars);
+        text(F13, ix, y + 52, "contract", COL_FAINT); text_r(F13, ix + vw, y + 53, b, COL_TEXT);
+        if (st.disrupted_until > UI.t) {
+            chip(ix, y + 72, "MARKET DISRUPTED", COL_BAD);
+        } else {
+            snprintf(b, sizeof b, "%s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
+            text(F13, ix, y + 72, "next delivery", COL_FAINT); text_r(F13, ix + vw, y + 73, b, COL_DIM);
+        }
+    } else if (nd.info.type == T_CHEM_DISRUPTION || nd.info.type == TRACE_NODE_ADDITIVE_STOCK) {
+        if (nd.info.type == TRACE_NODE_ADDITIVE_STOCK) {
+            snprintf(b, sizeof b, "%s", fmt_tons2(st.mass_t()).c_str());
+            text(F13, ix, y, "imported", COL_FAINT); text_r(F13, ix + iw, y, b, COL_TEXT);
+            draw_elem_bar(ix, y + 22, iw, 6, st.mass);
+        } else {
+            if (st.disrupted_until > UI.t) {
+                snprintf(b, sizeof b, "%s left", fmt_dur(st.disrupted_until - (i64)UI.t).c_str());
+                chip(ix, y, b, COL_BAD);
+            } else {
+                snprintf(b, sizeof b, "calm · next %s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
+                text_trunc(F13, ix, y, b, COL_FAINT, iw);
             }
         }
-        y += chh + 17 * z;
-        snprintf(b, sizeof b, "belt %.0f t", st.belt_t());
-        text(F13, r.x + 8 * z, y, b, COL_DIM);
-    } else if (nd.info.type == T_TAILINGS) {
-        float fh = r.height - th - 12 * z;
-        DrawRectangle(r.x + 8 * z, r.y + th + 6 * z, r.width - 16 * z, fh, COL_PANEL2);
-        double u = clampd(st.mass_t() / 600000.0, 0, 1);
-        if (u > 0.01) DrawRectangle(r.x + 9 * z, r.y + th + 6 * z + fh * (1 - (float)u),
-                                    r.width - 18 * z, fh * (float)u, Fade(nd.color, 0.45f));
-        snprintf(b, sizeof b, "%.0f t", st.mass_t());
-        Vector2 ts = measure(FB20, b);
-        text(FB20, r.x + (r.width - ts.x) / 2, r.y + th + 6 * z + fh / 2 - 10, b, COL_TEXT);
-    } else if (nd.info.type == T_CHEM_SRC) {
-        float fh = r.height - th - 12 * z;
-        float tw = 36 * z;
-        DrawRectangle(r.x + r.width - tw - 10 * z, r.y + th + 6 * z, tw, fh, COL_PANEL2);
-        double u = clampd(st.chem() / (double)nd.info.mass_capacity, 0, 1);
-        if (u > 0.005) DrawRectangle(r.x + r.width - tw - 9 * z, r.y + th + 6 * z + fh * (1 - (float)u),
-                                     tw - 2, fh * (float)u, Fade(nd.color, 0.75f));
-        float ty = r.y + th + 6 * z;
-        snprintf(b, sizeof b, "tank %.0f t", st.chem());  text(F16, r.x + 10 * z, ty, b, COL_TEXT); ty += 21 * z;
-        snprintf(b, sizeof b, "burned %.0f t", st.chem_burned); text(F13, r.x + 10 * z, ty, b, COL_DIM); ty += 18 * z;
-        snprintf(b, sizeof b, "contract %d cars", st.chem_cars); text(F13, r.x + 10 * z, ty, b, COL_DIM); ty += 18 * z;
-        snprintf(b, sizeof b, "next %s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
-        text(F13, r.x + 10 * z, ty, b, st.disrupted_until > UI.t ? COL_BAD : COL_FAINT);
-    } else if (nd.info.type == TRACE_NODE_ADDITIVE_STOCK) {
-        snprintf(b, sizeof b, "%.1f t Dy oxide", st.mass_t());
-        text(F16, r.x + 10 * z, y, b, COL_TEXT);
-        draw_elem_bar(r.x + 10 * z, y + 24 * z, r.width - 20 * z, 7 * z, st.mass);
     } else {
-        float bh = 14 * z, bw = r.width - 16 * z;
-        snprintf(b, sizeof b, "stock %s", fmt_tons(st.mass_t()).c_str());
-        draw_bar(r.x + 8 * z, y, bw, bh, st.mass_t(), nd.info.mass_capacity, nd.color, b); y += bh + 4 * z;
-        if (st.wip_t() > 0.005 || nd.info.type == T_CRUSHER || nd.info.type == T_FLOTATION) {
-            snprintf(b, sizeof b, "wip %s", fmt_tons(st.wip_t()).c_str());
-            draw_bar(r.x + 8 * z, y, bw, bh, st.wip_t(), 150, COL_WARN, b); y += bh + 4 * z;
+        // generic processor card: stock/wip/out + elements + footer
+        double vw = iw;
+        snprintf(b, sizeof b, "%s", fmt_tons2(st.mass_t()).c_str());
+        stat_line(ix, y, vw, "stock", b, COL_TEXT, st.mass_t(),
+                  std::isfinite(nd.info.mass_capacity) ? nd.info.mass_capacity : 250, nd.color); y += 27;
+        bool is_proc = (nd.info.type == T_CRUSHER || nd.info.type == T_FLOTATION);
+        if (st.wip_t() > 0.005 || is_proc) {
+            snprintf(b, sizeof b, "%s", fmt_tons2(st.wip_t()).c_str());
+            stat_line(ix, y, vw, "wip", b, st.wip_t() > 0 ? COL_WARN : COL_FAINT, st.wip_t(), 6000, COL_WARN); y += 27;
         }
         if (st.out_t() > 0.005) {
-            snprintf(b, sizeof b, "out %s", fmt_tons(st.out_t()).c_str());
-            draw_bar(r.x + 8 * z, y, bw, bh, st.out_t(), HUGE_VAL, COL_GOOD, b); y += bh + 4 * z;
+            snprintf(b, sizeof b, "%s", fmt_tons2(st.out_t()).c_str());
+            stat_line(ix, y, vw, "product", b, COL_GOOD, st.out_t(), 80000, COL_GOOD); y += 27;
         }
-        if (st.mass_t() > 0.01) draw_elem_bar(r.x + 8 * z, y, bw, 7 * z, st.mass);
-        y += 12 * z;
+        if (st.mass_t() > 0.01 || st.wip_t() > 0.01) {
+            draw_elem_bar(ix, y + 2, iw, 6, st.mass_t() > 0.01 ? st.mass : (const float*)nullptr);
+            y += 14;
+        }
         double tot = st.mass_t(), reo = 0;
         for (int e = 0; e < 5; e++) reo += st.m(e);
-        snprintf(b, sizeof b, "grade %.1f%%   next in %s", tot > 1 ? 100 * reo / tot : 0,
-                 fmt_dur(st.next_tick - (i64)UI.t).c_str());
-        text(F13, r.x + 8 * z, y, b, COL_FAINT);
+        snprintf(b, sizeof b, "grade %.1f%%", tot > 1 ? 100 * reo / tot : 0.0);
+        float gw = measure(F13, b).x;
+        snprintf(b, sizeof b, "next %s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
+        float nw = measure(F13, b).x;
+        if (gw + nw + 12 < iw) {
+            text(F13, ix, y + 2, "grade", COL_FAINT);
+            text(F13, ix + 44, y + 2, b, st.next_tick > UI.t ? COL_ACCENT : COL_FAINT);
+        } else {   // too tight: two lines
+            char b2[64];
+            snprintf(b2, sizeof b2, "grade %.1f%%", tot > 1 ? 100 * reo / tot : 0.0);
+            text(F13, ix, y + 2, b2, COL_FAINT);
+            text(F13, ix, y + 17, b, st.next_tick > UI.t ? COL_ACCENT : COL_FAINT);
+        }
     }
 
     // subtle ring when the node ticked at the current tick
     if (((TR.ticked[UI.k] >> n) & 1))
-        DrawRectangleRoundedLinesEx({ r.x - 3, r.y - 3, r.width + 6, r.height + 6 }, 0.12f, 4, 1.5f, Fade(COL_TEXT, 0.22f));
+        DrawRectangleRoundedLinesEx({ r.x - 3, r.y - 3, r.width + 6, r.height + 6 }, 0.09f, 6, 1.3f, Fade(COL_TEXT, 0.18f));
 }
 
 // 3-segment orthogonal route from src right edge to dst left edge
 static void edge_route(int from, int to, Vector2 pts[4]) {
     Rectangle a = node_rect(from), b = node_rect(to);
-    Vector2 p0 = { a.x + a.width, a.y + a.height * 0.35f };
-    Vector2 p3 = { b.x, b.y + b.height * 0.35f };
+    Vector2 p0 = { a.x + a.width, a.y + a.height * 0.42f };
+    Vector2 p3 = { b.x, b.y + b.height * 0.42f };
     float mx = (p0.x + p3.x) / 2;
     pts[0] = p0; pts[1] = { mx, p0.y }; pts[2] = { mx, p3.y }; pts[3] = p3;
 }
@@ -804,114 +1004,37 @@ static Vector2 route_point(Vector2 pts[4], float u) {
     for (int i = 0; i < 3; i++) {
         if (d <= lens[i] || i == 2) {
             float uu = lens[i] > 0 ? d / lens[i] : 0;
-            return { (float)lerpd(pts[i].x, pts[i + 1].x, (double)uu),
-                      (float)lerpd(pts[i].y, pts[i + 1].y, (double)uu) };
+            return { (float)lerpd((double)pts[i].x, (double)pts[i + 1].x, (double)uu),
+                     (float)lerpd((double)pts[i].y, (double)pts[i + 1].y, (double)uu) };
         }
         d -= lens[i];
     }
     return pts[3];
 }
 
-static void draw_edge(int from, int to, Color c, float thick, bool dashed) {
+static void draw_edge(int from, int to, Color c, float thick, bool dotted) {
     Vector2 pts[4];
     edge_route(from, to, pts);
-    if (dashed) {
+    if (dotted) {
         for (int s = 0; s < 3; s++) {
             float len = Vector2Distance(pts[s], pts[s + 1]);
             if (len < 1) continue;
             Vector2 d = { (pts[s + 1].x - pts[s].x) / len, (pts[s + 1].y - pts[s].y) / len };
-            for (float u = 0; u < len; u += 22)
+            for (float u = 0; u < len; u += 18)
                 DrawLineEx({ pts[s].x + d.x * u, pts[s].y + d.y * u },
-                           { pts[s].x + d.x * std::min(u + 12, len), pts[s].y + d.y * std::min(u + 12, len) },
-                           thick, c);
+                           { pts[s].x + d.x * std::min(u + 3, len), pts[s].y + d.y * std::min(u + 3, len) }, thick, c);
         }
     } else {
         DrawLineEx(pts[0], pts[1], thick, c);
         DrawLineEx(pts[1], pts[2], thick, c);
         DrawLineEx(pts[2], pts[3], thick, c);
+        Vector2 dir = Vector2Normalize(Vector2Subtract(pts[3], pts[2]));
+        Vector2 perp = { -dir.y, dir.x };
+        float as = 6 + thick;
+        DrawTriangle(pts[3],
+                     { pts[3].x - dir.x * as - perp.x * as * 0.55f, pts[3].y - dir.y * as - perp.y * as * 0.55f },
+                     { pts[3].x - dir.x * as + perp.x * as * 0.55f, pts[3].y - dir.y * as + perp.y * as * 0.55f }, c);
     }
-    // arrowhead
-    Vector2 dir = Vector2Normalize(Vector2Subtract(pts[3], pts[2]));
-    Vector2 perp = { -dir.y, dir.x };
-    float as = 6 + thick * 2;
-    DrawTriangle(pts[3],
-                 { pts[3].x - dir.x * as - perp.x * as * 0.55f, pts[3].y - dir.y * as - perp.y * as * 0.55f },
-                 { pts[3].x - dir.x * as + perp.x * as * 0.55f, pts[3].y - dir.y * as + perp.y * as * 0.55f }, c);
-}
-
-// the haul truck: a moving glyph on the mine → crusher road
-static Vector2 truck_pos(int truck) {
-    Node& nd = TR.nodes[truck];
-    NodeState& st = FR.st[truck];
-    // last truck-state change before now
-    i64 t_change = TR.ticks[0];
-    const StateChange* best = nullptr;
-    for (auto& sc : nd.state_changes)
-        if (sc.field == 1 && sc.t <= UI.t) { best = &sc; }
-    if (best) t_change = best->t;
-    double u = clampd((UI.t - t_change) / (double)MS_HOUR, 0, 1);
-    double prog;
-    if (st.truck_state == 2) prog = u;            // loaded, mine → plant
-    else if (st.truck_state == 3) prog = 1 - u;   // empty, plant → mine
-    else if (st.truck_state == 1) prog = 1.0;     // dumping at plant
-    else prog = 0.0;                              // loading at mine
-    // road from mine to crusher, offset below the boxes
-    int mine = -1, crusher = -1;
-    for (size_t i = 0; i < TR.nodes.size(); i++) {
-        if (TR.nodes[i].info.type == T_MINER) mine = (int)i;
-        if (TR.nodes[i].info.type == T_CRUSHER) crusher = (int)i;
-    }
-    if (mine < 0 || crusher < 0) return world_to_screen(nd.pos);
-    Rectangle a = node_rect(mine), b2 = node_rect(crusher);
-    float x0 = a.x + a.width * 0.55f, x1 = b2.x + b2.width * 0.3f;
-    float y = a.y + a.height + 34 * UI.zoom;
-    return { (float)lerpd((double)x0, (double)x1, prog), y };
-}
-
-static void draw_truck(int truck) {
-    Node& nd = TR.nodes[truck];
-    NodeState& st = FR.st[truck];
-    Vector2 tp = truck_pos(truck);
-    float s = clampd(UI.zoom, 0.6f, 1.4f);
-
-    // road
-    int mine = -1, crusher = -1;
-    for (size_t i = 0; i < TR.nodes.size(); i++) {
-        if (TR.nodes[i].info.type == T_MINER) mine = (int)i;
-        if (TR.nodes[i].info.type == T_CRUSHER) crusher = (int)i;
-    }
-    if (mine >= 0 && crusher >= 0) {
-        Rectangle a = node_rect(mine), b2 = node_rect(crusher);
-        float x0 = a.x + a.width * 0.55f, x1 = b2.x + b2.width * 0.3f;
-        float y = a.y + a.height + 34 * UI.zoom;
-        DrawLineEx({ x0, y + 8 * s }, { x1, y + 8 * s }, 3, Fade(COL_BORDER, 0.9f));
-        for (float x = x0; x < x1; x += 26 * s)
-            DrawLineEx({ x, y + 8 * s - 4 }, { x + 12 * s, y + 8 * s - 4 }, 1.5f, Fade(COL_FAINT, 0.5f));
-    }
-
-    // body
-    Rectangle body = { tp.x - 18 * s, tp.y - 12 * s, 36 * s, 20 * s };
-    bool sel = UI.sel == truck, hov = UI.hover == truck;
-    DrawRectangleRec(body, COL_PANEL);
-    DrawRectangleLinesEx(body, 1.5f, sel ? COL_PLAYHEAD : (hov ? COL_ACCENT : nd.color));
-    // bed fill = load
-    double load = clampd(st.mass_t() / 100.0, 0, 1);
-    if (load > 0.01) DrawRectangle(body.x + 2, body.y + 2 + (body.height - 4) * (1 - (float)load),
-                                  body.width - 4, (body.height - 4) * (float)load, Fade(nd.color, 0.7f));
-    // cab
-    DrawRectangle(tp.x + 16 * s, tp.y - 6 * s, 10 * s, 12 * s, Fade(nd.color, 0.9f));
-    // wheels
-    DrawCircle(tp.x - 10 * s, tp.y + 9 * s, 3.5f * s, COL_FAINT);
-    DrawCircle(tp.x + 10 * s, tp.y + 9 * s, 3.5f * s, COL_FAINT);
-
-    // status bubble
-    char b[64];
-    snprintf(b, sizeof b, "%s  %.0f t", truck_name(st.truck_state), st.mass_t());
-    Vector2 ts = measure(F13, b);
-    float bx = tp.x - (ts.x + 12) / 2, by = tp.y - 34 * s;
-    DrawRectangle(bx, by, ts.x + 12, 17, { 20, 26, 34, 230 });
-    DrawRectangleLinesEx({ bx, by, ts.x + 12, 17 }, 1, sel ? COL_PLAYHEAD : COL_BORDER);
-    text(F13, bx + 6, by, b, COL_TEXT);
 }
 
 // ============================================================================
@@ -926,7 +1049,10 @@ static float tl_t_to_x(double t) {
 }
 
 static const Color MARK_COL[N_KINDS] = {
-    COL_WARN, COL_ACCENT, { 251, 146, 60, 255 }, COL_BAD, { 34, 211, 238, 255 }, COL_GOOD
+    { 190, 145, 45, 255 }, COL_ACCENT, { 235, 130, 60, 255 }, COL_BAD, { 34, 190, 210, 255 }, COL_GOOD
+};
+static const char* MARK_NAME[N_KINDS] = {
+    "pad empty", "acid low", "flot starved", "acid disruption", "S&OP scrum", "campaign"
 };
 
 static void draw_timeline() {
@@ -934,34 +1060,42 @@ static void draw_timeline() {
     DrawRectangleRec(r, COL_PANEL);
     DrawRectangleLinesEx(r, 1, COL_BORDER);
 
-    float chart_h = r.height - 86;
-    float chart_y = r.y + 8;
+    float chart_h = r.height - 92;
+    float chart_y = r.y + 10;
     i64 t_end = TR.t_end;
+    float y0 = chart_y + 4, ch = chart_h - 22;
 
-    // ---- grid + time labels ------------------------------------------------
+    // ---- horizontal gridlines ------------------------------------------------
+    for (int i = 1; i <= 3; i++)
+        DrawLine(r.x, y0 + ch * i / 4, r.x + r.width, y0 + ch * i / 4, Fade(COL_BORDER, 0.35f));
+
+    // ---- vertical grid + time labels -------------------------------------------
     double span = UI.vw1 - UI.vw0;
     double steps[] = { MS_HOUR, 6 * MS_HOUR, MS_DAY, 7 * MS_DAY, 30 * MS_DAY, 90 * MS_DAY, 365 * MS_DAY };
     double step = steps[6];
-    for (double s : steps) if (s / span * LY.timeline.width > 90) { step = s; break; }
-    if (365.0 * MS_DAY / span * LY.timeline.width < 60) step = 2 * 365 * MS_DAY;
+    for (double s : steps) if (s / span * LY.timeline.width > 110) { step = s; break; }
+    if (365.0 * MS_DAY / span * LY.timeline.width < 80) step = 2 * 365 * MS_DAY;
     for (double t = ceil(UI.vw0 / step) * step; t < UI.vw1; t += step) {
         float x = tl_t_to_x(t);
-        DrawLine(x, chart_y, x, chart_y + chart_h, Fade(COL_BORDER, 0.55f));
+        DrawLine(x, chart_y, x, chart_y + chart_h, Fade(COL_BORDER, 0.5f));
         char b[32];
         double days = t / MS_DAY;
         if (step >= 90 * MS_DAY) snprintf(b, sizeof b, "Y%d D%03d", (int)(days / 365) + 1, (int)days % 365 + 1);
         else snprintf(b, sizeof b, "D%03d", (int)days);
-        text(F13, x + 3, chart_y + chart_h - 13, b, COL_FAINT);
+        text(F13, x + 3, chart_y + chart_h - 14, b, COL_FAINT);
     }
 
-    // ---- node stock envelopes, each normalized to its own max ----------------
+    // ---- node stock envelopes, each normalized to its own max -----------------
     for (size_t n = 0; n < TR.nodes.size(); n++) {
         Node& nd = TR.nodes[n];
-        double nmax = 0;
-        for (int b = 0; b < NB; b++) nmax = std::max(nmax, (double)nd.series[b].mass.mx);
+        double nmax = 0, nmin = 1e30;
+        for (int b = 0; b < NB; b++) {
+            nmax = std::max(nmax, (double)nd.series[b].mass.mx);
+            nmin = std::min(nmin, (double)nd.series[b].mass.mn);
+        }
         if (nmax < 1) continue;
+        if ((nmax - nmin) / nmax < 0.01 && (int)n != UI.sel) continue;   // flat line: reads as a border
         bool strong = (int)n == UI.sel;
-        float y0 = chart_y + 4, h = chart_h - 24;
         for (int px = (int)r.x; px < (int)(r.x + r.width); px++) {
             double ta = tl_x_to_t((float)px), tb = tl_x_to_t((float)(px + 1));
             int b0 = (int)clampd(ta / t_end * NB, 0, NB - 1);
@@ -972,26 +1106,47 @@ static void draw_timeline() {
                 mx = std::max(mx, nd.series[b].mass.mx);
             }
             if (mx < 0) continue;
-            float yn = y0 + h * (1 - (float)(mn / nmax) * 0.92f);
-            float yx = y0 + h * (1 - (float)(mx / nmax) * 0.92f);
-            DrawRectangle((float)px, yn, 1, std::max(1.0f, yx - yn + 1), Fade(nd.color, strong ? 0.9f : 0.38f));
+            float yn = y0 + ch * (1 - (float)(mn / nmax) * 0.94f);
+            float yx = y0 + ch * (1 - (float)(mx / nmax) * 0.94f);
+            DrawRectangle((float)px, yn, 1, std::max(1.0f, yx - yn + 1),
+                          strong ? Fade(nd.color, 0.95f) : Fade(nd.color, 0.55f));
+        }
+        // selected: current value tag at the playhead
+        if (strong) {
+            double v = FR.st[n].mass_t();
+            double u = clampd(v / nmax, 0, 1);
+            DrawCircle(tl_t_to_x(UI.t), y0 + ch * (1 - (float)u * 0.94f), 3.5f, nd.color);
         }
     }
 
-    // ---- mark lanes ----------------------------------------------------------
-    float lane_y = chart_y + chart_h + 6;
-    float lane_h = 4, lane_gap = 3;
+    // ---- mark lanes -------------------------------------------------------------
+    float lane_y = chart_y + chart_h + 8;
+    float lane_h = 4, lane_gap = 4;
     for (auto& mk : TR.marks) {
         float x = tl_t_to_x((double)mk.t0);
         float x2 = tl_t_to_x((double)mk.t1);
         float y = lane_y + mk.kind * (lane_h + lane_gap);
-        if (mk.t0 == mk.t1) DrawRectangle(x - 0.5f, y, 1.5f, lane_h, MARK_COL[mk.kind]);
-        else DrawRectangle(x, y - (mk.kind == N_DISRUPTED ? 1 : 0),
-                           std::max(1.5f, x2 - x), lane_h + (mk.kind == N_DISRUPTED ? 2 : 0),
-                           Fade(MARK_COL[mk.kind], mk.kind == N_DISRUPTED ? 0.85f : 0.55f));
+        if (mk.t0 == mk.t1) DrawRectangle(x - 0.5f, y, 1.5f, lane_h, Fade(MARK_COL[mk.kind], 0.9f));
+        else DrawRectangle(x, y, std::max(1.5f, x2 - x), lane_h + (mk.kind == N_DISRUPTED ? 2 : 0),
+                           Fade(MARK_COL[mk.kind], mk.kind == N_DISRUPTED ? 0.7f : 0.42f));
     }
 
-    // ---- hover crosshair + tooltip -------------------------------------------
+    // ---- caption + legend ---------------------------------------------------------
+    float cap_y = lane_y + N_KINDS * (lane_h + lane_gap) + 5;
+    const char* caption = "drag to scrub · wheel zoom · dblclick fit";
+    text(F13, r.x + 10, cap_y, caption, COL_FAINT);
+    float lx = r.x + 10 + measure(F13, caption).x + 22;
+    for (int k = 0; k < N_KINDS; k++) {
+        bool used = false;
+        for (auto& mk : TR.marks) if (mk.kind == k) { used = true; break; }
+        if (!used) continue;
+        if (lx + measure(F13, MARK_NAME[k]).x + 18 > r.x + r.width) break;
+        DrawRectangle(lx, cap_y + 4, 9, 3, Fade(MARK_COL[k], 0.85f));
+        text(F13, lx + 14, cap_y, MARK_NAME[k], COL_FAINT);
+        lx += measure(F13, MARK_NAME[k]).x + 28;
+    }
+
+    // ---- hover crosshair + tooltip ------------------------------------------------
     bool hover_tl = CheckCollisionPointRec(UI.mouse, r) && !UI.scrubbing;
     if (hover_tl) {
         double ht = tl_x_to_t(UI.mouse.x);
@@ -1008,17 +1163,19 @@ static void draw_timeline() {
         snprintf(UI.tooltip, sizeof UI.tooltip, "%s", buf);
     }
 
-    // ---- minimap when zoomed --------------------------------------------------
-    float mm_y = lane_y + N_KINDS * (lane_h + lane_gap) + 4;
-    float mm_h = 9;
+    // ---- minimap when zoomed --------------------------------------------------------
+    float mm_y = cap_y + 15;
+    float mm_h = 8;
     if (UI.vw1 - UI.vw0 < t_end * 0.995) {
+        LY.tl_minimap = { r.x, mm_y, r.width, mm_h };
         DrawRectangle(r.x, mm_y, r.width, mm_h, COL_PANEL2);
-        DrawRectangleLinesEx({ r.x, mm_y, r.width, mm_h }, 1, COL_BORDER);
+        DrawRectangleLinesEx(LY.tl_minimap, 1, COL_BORDER);
+        // faint full-run silhouette of the selected node
         float wx0 = r.x + (float)(UI.vw0 / t_end) * r.width;
         float wx1 = r.x + (float)(UI.vw1 / t_end) * r.width;
         DrawRectangle(wx0, mm_y + 1, std::max(3.0f, wx1 - wx0), mm_h - 2, Fade(COL_ACCENT, 0.45f));
         static bool mm_drag = false;
-        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(UI.mouse, { r.x, mm_y, r.width, mm_h }))
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(UI.mouse, LY.tl_minimap))
             mm_drag = true;
         if (!IsMouseButtonDown(MOUSE_LEFT_BUTTON)) mm_drag = false;
         if (mm_drag) {
@@ -1028,13 +1185,19 @@ static void draw_timeline() {
             UI.vw1t = UI.vw0t + sp;
         }
     } else {
-        text(F13, r.x + 8, mm_y, "whole run — drag to scrub, wheel to zoom, shift+drag to pan", COL_FAINT);
+        LY.tl_minimap = { -1, -1, -1, -1 };
     }
 
-    // ---- playhead ---------------------------------------------------------------
+    // ---- playhead with time flag -----------------------------------------------------
     float px = tl_t_to_x(UI.t);
-    DrawRectangle(px - 1, chart_y, 2, chart_h + 6 + N_KINDS * (lane_h + lane_gap), Fade(COL_PLAYHEAD, 0.95f));
-    DrawTriangle({ px - 6, r.y + 1 }, { px + 6, r.y + 1 }, { px, r.y + 10 }, COL_PLAYHEAD);
+    DrawRectangle(px - 1, chart_y, 2, chart_y + chart_h + 8 + N_KINDS * (lane_h + lane_gap) - chart_y, Fade(COL_PLAYHEAD, 0.95f));
+    char fb[32];
+    snprintf(fb, sizeof fb, "Y%d D%03d", (int)(UI.t / MS_DAY / 365) + 1, (int)(UI.t / MS_DAY) % 365 + 1);
+    Vector2 fts = measure(F13, fb);
+    float fx = clampd(px - (fts.x + 10) / 2, r.x + 2, r.x + r.width - fts.x - 12);
+    DrawRectangle(fx, r.y, fts.x + 10, 17, COL_PLAYHEAD);
+    DrawTriangle({ px - 4, r.y + 20 }, { px, r.y + 13 }, { px + 4, r.y + 20 }, COL_PLAYHEAD);
+    text(F13, fx + 5, r.y + 2, fb, Color{ 40, 30, 8, 255 });
     DrawTriangle({ px - 5, r.y + r.height - 1 }, { px, r.y + r.height - 9 }, { px + 5, r.y + r.height - 1 }, COL_PLAYHEAD);
 }
 
@@ -1042,20 +1205,37 @@ static void draw_timeline() {
 //                                inspector
 // ============================================================================
 
+// chart with a legend line above it and day labels below
 static void draw_series_chart(Rectangle r, int n, double t0, double t1) {
-    DrawRectangleRec(r, COL_PANEL2);
     Node& nd = TR.nodes[n];
-    struct SRef { Series NodeSeries::* s; Color c; };
+    struct SRef { Series NodeSeries::* s; Color c; const char* name; };
     SRef refs[4] = {
-        { &NodeSeries::mass, nd.color },
-        { &NodeSeries::wip, COL_WARN },
-        { &NodeSeries::out, COL_GOOD },
-        { &NodeSeries::chem, COL_ACCENT },
+        { &NodeSeries::mass, nd.color, "stock" },
+        { &NodeSeries::wip, COL_WARN, "wip" },
+        { &NodeSeries::out, COL_GOOD, "product" },
+        { &NodeSeries::chem, COL_ACCENT, "acid" },
     };
     double maxs[4] = {};
     for (int ri = 0; ri < 4; ri++)
         for (int b = 0; b < NB; b++)
             maxs[ri] = std::max(maxs[ri], (double)(nd.series[b].*refs[ri].s).mx);
+
+    // legend above: colored dash + name + max
+    float lx = r.x;
+    for (int ri = 0; ri < 4; ri++) {
+        if (maxs[ri] < 0.01) continue;
+        char b[48];
+        if (maxs[ri] >= 1000) snprintf(b, sizeof b, "%.1fk", maxs[ri] / 1000);
+        else snprintf(b, sizeof b, "%.0f", maxs[ri]);
+        char b2[64]; snprintf(b2, sizeof b2, "%s %s", refs[ri].name, b);
+        DrawRectangle(lx, r.y - 12, 10, 2.5f, refs[ri].c);
+        text(F13, lx + 15, r.y - 20, b2, COL_FAINT);
+        lx += 15 + measure(F13, b2).x + 12;
+    }
+
+    DrawRectangleRec(r, COL_PANEL2);
+    for (int i = 0; i <= 4; i++)
+        DrawLine(r.x, r.y + 3 + (r.height - 6) * i / 4, r.x + r.width, r.y + 3 + (r.height - 6) * i / 4, Fade(COL_BORDER, 0.3f));
     for (int ri = 0; ri < 4; ri++) {
         if (maxs[ri] < 0.01) continue;
         float px_prev = -1, y_prev = -1;
@@ -1063,16 +1243,20 @@ static void draw_series_chart(Rectangle r, int n, double t0, double t1) {
             double t = t0 + (double)px / r.width * (t1 - t0);
             int b = (int)clampd(t / TR.t_end * NB, 0, NB - 1);
             float y = r.y + r.height - 3 - (float)(((nd.series[b].*refs[ri].s).last / maxs[ri]) * (r.height - 8));
-            if (px_prev >= 0) DrawLineEx({ px_prev, y_prev }, { r.x + px, y }, 1.5f, refs[ri].c);
+            if (px_prev >= 0) DrawLineEx({ px_prev, y_prev }, { r.x + px, y }, 1.6f, refs[ri].c);
             px_prev = r.x + px; y_prev = y;
         }
-        // max label
-        char b[32]; snprintf(b, sizeof b, "%.0f", maxs[ri]);
-        text(F13, r.x + 4, r.y + 2 + ri * 12, b, Fade(refs[ri].c, 0.9f));
     }
     float px = r.x + (float)((UI.t - t0) / (t1 - t0)) * r.width;
     if (px >= r.x && px <= r.x + r.width) DrawLine(px, r.y, px, r.y + r.height, Fade(COL_PLAYHEAD, 0.95f));
     DrawRectangleLinesEx(r, 1, COL_BORDER);
+
+    // day labels below
+    char b[32];
+    snprintf(b, sizeof b, "D%lld", (long long)(t0 / MS_DAY));
+    text(F13, r.x, r.y + r.height + 4, b, COL_FAINT);
+    snprintf(b, sizeof b, "D%lld", (long long)(t1 / MS_DAY));
+    text_r(F13, r.x + r.width, r.y + r.height + 4, b, COL_FAINT);
 }
 
 static void draw_state_strip(Rectangle r, int n) {
@@ -1084,30 +1268,32 @@ static void draw_state_strip(Rectangle r, int n) {
     if (rows == 0) { text(F13, r.x + 6, r.y + 4, "no state changes", COL_FAINT); return; }
 
     uint8_t cur[3] = { FR.st[n].proc_state, FR.st[n].truck_state, FR.st[n].conv_state };
+    const char* row_names[3] = { "proc", "truck", "conv" };
     int f_drawn = -1;
     for (int f = 0; f < 3; f++) {
         if (!has[f]) continue;
         f_drawn++;
         float y = r.y + 2 + f_drawn * (r.height / rows);
-        float h = r.height / rows - 4;
+        float h = r.height / rows - 3;
         i64 t_prev = TR.ticks[0];
         uint8_t v_prev = 0;
-        Color c;
+        auto seg_col = [&](uint8_t v) {
+            if (f == 1) return v >= 2 ? &COL_ACCENT : (v == 1 ? &COL_GOOD : &COL_DIM);
+            return v == 2 ? &COL_WARN : (v == 1 ? &COL_DIM : &COL_PANEL2);
+        };
         for (auto& sc : nd.state_changes) {
             if (sc.field != f) continue;
             float x0 = r.x + (float)((double)t_prev / TR.t_end) * r.width;
             float x1 = r.x + (float)((double)sc.t / TR.t_end) * r.width;
-            c = v_prev == 2 ? COL_WARN : (v_prev == 1 ? COL_DIM : COL_PANEL2);
-            if (f == 1) c = v_prev >= 2 ? COL_ACCENT : (v_prev == 1 ? COL_GOOD : COL_DIM);
-            DrawRectangle(x0, y, std::max(0.5f, x1 - x0), h, Fade(c, 0.8f));
+            DrawRectangle(x0, y, std::max(0.5f, x1 - x0), h, Fade(*seg_col(v_prev), 0.8f));
             t_prev = sc.t; v_prev = sc.value;
         }
-        c = v_prev == 2 ? COL_WARN : (v_prev == 1 ? COL_DIM : COL_PANEL2);
-        if (f == 1) c = v_prev >= 2 ? COL_ACCENT : (v_prev == 1 ? COL_GOOD : COL_DIM);
         float x0 = r.x + (float)((double)t_prev / TR.t_end) * r.width;
-        DrawRectangle(x0, y, r.x + r.width - x0, h, Fade(c, 0.8f));
+        DrawRectangle(x0, y, r.x + r.width - x0, h, Fade(*seg_col(v_prev), 0.8f));
         const char* lbl = f == 0 ? proc_name(cur[0]) : (f == 1 ? truck_name(cur[1]) : conv_name(cur[2]));
-        text(F13, r.x + 4, y + h / 2 - 6, lbl, COL_TEXT);
+        text(F13, r.x + 4, y + 1, row_names[f], COL_FAINT);
+        float lw = measure(F13, row_names[f]).x + 8;
+        text(F13, r.x + 4 + lw, y + 1, lbl, COL_TEXT);
     }
     float px = r.x + (float)((double)UI.t / TR.t_end) * r.width;
     DrawLine(px, r.y, px, r.y + r.height, Fade(COL_PLAYHEAD, 0.95f));
@@ -1119,12 +1305,15 @@ static void draw_inspector() {
     DrawRectangleLinesEx(r, 1, COL_BORDER);
     BeginScissorMode((int)r.x, (int)r.y, (int)r.width, (int)r.height);
 
-    if (UI.sel < 0) {
-        float x = r.x + 16, y = r.y + 14;
-        text(FB20, x, y, "Inspector", COL_TEXT); y += 30;
-        text(F16, x, y, "click a node in the graph, or a table row", COL_DIM); y += 40;
+    float x = r.x + 16, y = r.y + 14 - UI.insp_scroll;
+    float iw = r.width - 32;
+    char b[160];
 
-        text(FB16, x, y, "System inventory (elements in stocks)", COL_TEXT); y += 22;
+    if (UI.sel < 0) {
+        text(FB20, x, y, "Inspector", COL_TEXT); y += 30;
+        text(F16, x, y, "click a node in the graph, or a table row", COL_DIM); y += 42;
+
+        text(FB16, x, y, "SYSTEM INVENTORY · ELEMENTS IN ALL STOCKS", COL_TEXT); y += 22;
         double elem[6] = {};
         for (size_t n = 0; n < TR.nodes.size(); n++)
             for (int e = 0; e < 6; e++)
@@ -1132,90 +1321,126 @@ static void draw_inspector() {
         double tot = 0; for (double e : elem) tot += e;
         float cx = x;
         for (int e = 0; e < 6; e++) {
-            float w = tot > 0 ? (float)(elem[e] / tot) * (r.width - 32) : 0;
-            DrawRectangle(cx, y, w, 16, COL_ELEMS[e]); cx += w;
+            float w = tot > 0 ? (float)(elem[e] / tot) * iw : 0;
+            DrawRectangle(cx, y, w, 14, COL_ELEMS[e]); cx += w;
         }
         y += 24;
-        char b[96];
         for (int e = 0; e < 6; e++) {
-            snprintf(b, sizeof b, "%-5s %12.0f t   %5.1f%%", ELEM_NAMES[e], elem[e], tot > 0 ? 100 * elem[e] / tot : 0);
-            text(F13, x, y, b, e < 5 ? COL_ELEMS[e] : COL_DIM); y += 17;
+            snprintf(b, sizeof b, "%-5s", ELEM_NAMES[e]);
+            text(F13, x, y, b, e < 5 ? COL_ELEMS[e] : COL_DIM);
+            snprintf(b, sizeof b, "%12.0f t", elem[e]);
+            text_r(F13, x + iw * 0.55f, y, b, COL_TEXT);
+            snprintf(b, sizeof b, "%5.1f%%", tot > 0 ? 100 * elem[e] / tot : 0);
+            text_r(F13, x + iw, y, b, COL_DIM);
+            y += 17;
         }
-        y += 16;
-        text(FB16, x, y, "Controls", COL_TEXT); y += 22;
+        y += 14;
+        text(FB16, x, y, "CONTROLS", COL_TEXT); y += 22;
         const char* lines[] = {
-            "space play/pause    ←/→ step tick    shift+←/→ day",
-            "PgUp/PgDn  jump to prev/next notable event",
-            "[ ] speed   R reload trace   F11 fullscreen   H help",
-            "timeline: drag = scrub (inertia), wheel = zoom,",
-            "          shift+drag = pan, double-click = fit",
-            "graph: click node = select, drag node = move,",
-            "       drag bg = pan, wheel = zoom",
+            "space  play/pause      <>  step one tick",
+            "shift + <>  step one day",
+            "PgUp/PgDn  jump to notable events",
+            "[ ]  playback speed    R  reload trace",
+            "F11 fullscreen   H help   Esc quit",
+            "",
+            "timeline: drag = scrub, wheel = zoom,",
+            "shift+wheel = pan, dbl-click = fit",
+            "graph: click node, drag node/bg, wheel",
         };
         for (auto& l : lines) { text(F13, x, y, l, COL_DIM); y += 17; }
+        UI.insp_h = 0;
+        EndScissorMode();
         return;
     }
 
     Node& nd = TR.nodes[UI.sel];
     NodeState& st = FR.st[UI.sel];
-    float x = r.x + 14, y = r.y + 12;
-    char b[160];
 
-    DrawCircle(x + 7, y + 11, 6, nd.color);
-    text(FB20, x + 20, y, nd.info.name, COL_TEXT); y += 30;
-    snprintf(b, sizeof b, "in: %s    out: %s",
+    // header
+    DrawCircle(x + 8, y + 10, 6, nd.color);
+    text_trunc(FB20, x + 24, y, nd.info.name, COL_TEXT, iw - 24); y += 28;
+    snprintf(b, sizeof b, "in: %s   out: %s",
              nd.info.input >= 0 ? TR.nodes[nd.info.input].info.name : "-",
              nd.info.output >= 0 ? TR.nodes[nd.info.output].info.name : "-");
-    text(F13, x, y, b, COL_FAINT); y += 22;
+    text_trunc(F13, x, y, b, COL_FAINT, iw); y += 24;
 
-    auto val_line = [&](const char* name, double v, Color c) {
-        text(F13, x, y, name, COL_DIM);
-        snprintf(b, sizeof b, "%.1f", v);
-        Vector2 ts = measure(F13, b);
-        text(F13, r.x + r.width - 16 - ts.x, y, b, c);
+    // state chips
+    text(FB16, x, y, "STATE", COL_TEXT); y += 20;
+    float cx2 = x;
+    if (nd.info.type == T_CRUSHER || nd.info.type == T_FLOTATION)
+        cx2 += chip(cx2, y, proc_name(st.proc_state), st.proc_state == 2 ? COL_WARN : COL_DIM) + 8;
+    if (nd.info.type == T_TRUCK)
+        cx2 += chip(cx2, y, truck_name(st.truck_state), st.truck_state >= 2 ? COL_ACCENT : COL_GOOD) + 8;
+    if (nd.info.type == T_CHEM_DISRUPTION && st.disrupted_until > UI.t)
+        cx2 += chip(cx2, y, "DISRUPTED", COL_BAD) + 8;
+    snprintf(b, sizeof b, "next event in %s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
+    text_r(F13, x + iw, y + 1, b, COL_ACCENT);
+    y += 30;
+
+    // values
+    text(FB16, x, y, "VALUES", COL_TEXT); y += 20;
+    auto vline = [&](const char* name, double v) {
+        text(F13, x, y, name, COL_FAINT);
+        snprintf(b, sizeof b, "%s", fmt_tons2(v, "").c_str());
+        text_r(F13, x + iw, y, b, COL_TEXT);
         y += 17;
     };
-    val_line("stock (t)", st.mass_t(), COL_TEXT);
-    val_line("wip (t)", st.wip_t(), COL_TEXT);
-    val_line("product (t)", st.out_t(), COL_TEXT);
-    if (nd.info.belt_cells > 0) val_line("belt (t)", st.belt_t(), COL_TEXT);
-    if (nd.info.type == T_CHEM_SRC) val_line("acid tank (t)", st.chem(), COL_ACCENT);
-    val_line("total (t)", st.level(), COL_TEXT);
-    val_line("stock REO (t)", [&]{ double s=0; for(int e=0;e<5;e++) s+=st.m(e); return s; }(), COL_TEXT);
-    y += 4;
+    vline("stock (t)", st.mass_t());
+    vline("wip (t)", st.wip_t());
+    vline("product (t)", st.out_t());
+    if (nd.info.belt_cells > 0) vline("belt (t)", st.belt_t());
+    if (nd.info.type == T_CHEM_SRC) vline("acid tank (t)", st.chem());
+    vline("total (t)", st.level());
+    double reo = 0; for (int e = 0; e < 5; e++) reo += st.m(e);
+    vline("stock REO (t)", reo);
+    y += 10;
 
-    snprintf(b, sizeof b, "proc %s · truck %s · conv %s", proc_name(st.proc_state), truck_name(st.truck_state), conv_name(st.conv_state));
-    text(F13, x, y, b, COL_DIM); y += 17;
-    snprintf(b, sizeof b, "next event in %s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
-    text(F13, x, y, b, COL_ACCENT); y += 24;
-
+    // element split
     if (st.mass_t() > 0.01) {
-        text(FB16, x, y, "stock element split", COL_TEXT); y += 18;
-        draw_elem_bar(x, y, r.width - 28, 10, st.mass); y += 16;
+        text(FB16, x, y, "STOCK ELEMENT SPLIT", COL_TEXT); y += 20;
+        draw_elem_bar(x, y, iw, 10, st.mass); y += 16;
+        double mt = st.mass_t();
         for (int e = 0; e < 6; e++) {
-            snprintf(b, sizeof b, "%-5s %10.1f t", ELEM_NAMES[e], st.m(e));
-            text(F13, x, y, b, e < 5 ? COL_ELEMS[e] : COL_DIM); y += 15;
+            text(F13, x, y, ELEM_NAMES[e], COL_ELEMS[e]);
+            snprintf(b, sizeof b, "%12.1f t", st.m(e));
+            text_r(F13, x + iw * 0.6f, y, b, COL_TEXT);
+            snprintf(b, sizeof b, "%5.1f%%", mt > 0 ? 100 * st.m(e) / mt : 0);
+            text_r(F13, x + iw, y, b, COL_DIM);
+            y += 16;
         }
-        y += 6;
+        y += 8;
     }
 
-    text(FB16, x, y, "history (whole run)", COL_TEXT); y += 18;
-    draw_series_chart({ x, y, r.width - 28, 96 }, UI.sel, 0, TR.t_end); y += 104;
+    // history
+    text(FB16, x, y, "HISTORY · WHOLE RUN", COL_TEXT); y += 26;
+    draw_series_chart({ x, y, iw, 88 }, UI.sel, 0, TR.t_end); y += 112;
 
     double zspan = std::max(30.0 * MS_DAY, UI.vw1 - UI.vw0);
-    text(FB16, x, y, "zoomed around playhead", COL_TEXT); y += 18;
-    draw_series_chart({ x, y, r.width - 28, 96 }, UI.sel, UI.t - zspan / 2, UI.t + zspan / 2); y += 104;
+    text(FB16, x, y, "HISTORY · AROUND PLAYHEAD", COL_TEXT); y += 26;
+    draw_series_chart({ x, y, iw, 88 }, UI.sel, UI.t - zspan / 2, UI.t + zspan / 2); y += 112;
 
-    text(FB16, x, y, "state over time", COL_TEXT); y += 18;
-    draw_state_strip({ x, y, r.width - 28, 40 }, UI.sel); y += 50;
+    text(FB16, x, y, "STATE OVER TIME", COL_TEXT); y += 19;
+    draw_state_strip({ x, y, iw, 40 }, UI.sel); y += 52;
 
-    if (button({ x, y, 132, 26 }, "< prev change", F13)) {
+    if (button({ x, y, 140, 26 }, "< prev change", F13)) {
         i64 best = -1;
         for (auto& sc : nd.state_changes) if (sc.t < UI.t - 1) best = std::max(best, sc.t);
         if (best >= 0) UI.t = best + 1;
     }
-    if (button({ x + 142, y, 132, 26 }, "next change >", F13)) {
+    if (button({ x + 150, y, 140, 26 }, "next change >", F13)) {
         for (auto& sc : nd.state_changes) if (sc.t > UI.t + 1) { UI.t = sc.t + 1; break; }
+    }
+    y += 34;
+
+    // content height + scrollbar
+    UI.insp_h = y + UI.insp_scroll - r.y;
+    float visible = r.height - 20;
+    if (UI.insp_h > visible) {
+        float track_h = r.height - 8;
+        float thumb_h = std::max(30.0f, track_h * visible / UI.insp_h);
+        float thumb_y = r.y + 4 + (track_h - thumb_h) * UI.insp_scroll / (UI.insp_h - visible);
+        DrawRectangle(r.x + r.width - 5, r.y + 4, 3, track_h, Fade(COL_BORDER, 0.4f));
+        DrawRectangle(r.x + r.width - 5, thumb_y, 3, thumb_h, Fade(COL_FAINT, 0.7f));
     }
     EndScissorMode();
 }
@@ -1230,33 +1455,57 @@ static void draw_table() {
     DrawLine(r.x, r.y, r.x + r.width, r.y, COL_BORDER);
     BeginScissorMode((int)r.x, (int)r.y, (int)r.width, (int)r.height);
 
-    float cols[9] = { 14, 190, 86, 92, 74, 84, 96, 108, 92 };
-    const char* heads[9] = { "", "node", "state", "stock t", "grade %", "wip t", "product t", "next event", "d 24h t" };
-    float y = r.y + 8, x = r.x + 14;
-    for (int i = 0; i < 9; i++) { text(F13, x + cols[i], y, heads[i], COL_FAINT); x += cols[i]; }
-    y += 19;
-    float rh = 17.5f;
+    // columns as cumulative x offsets (label column widths sized to content)
+    struct Col { const char* head; float w; bool right; };
+    Col cols[] = {
+        { "",       40,  false },   // color chip
+        { "node",   190, false },
+        { "state",  110, false },
+        { "stock t",100, true  },
+        { "grade %", 76, true  },
+        { "wip t",   86, true  },
+        { "product t", 104, true },
+        { "next event", 96, true },
+        { "24h \u0394 t", 84, true },
+    };
+    const int NC = 9;
+    float colx[NC];
+    float x0 = r.x + 16;
+    colx[0] = x0;
+    for (int i = 1; i < NC; i++) colx[i] = colx[i - 1] + cols[i - 1].w;
 
-    int rows = std::min((int)((r.height - 42) / rh), (int)TR.nodes.size());
+    float y = r.y + 10;
+    for (int i = 0; i < NC; i++) {
+        if (cols[i].right) text_r(F13, colx[i] + cols[i].w - 6, y, cols[i].head, COL_FAINT);
+        else text(F13, colx[i], y, cols[i].head, COL_FAINT);
+    }
+    DrawLine(r.x, y + 16, r.x + r.width, y + 16, Fade(COL_BORDER, 0.6f));
+    y += 22;
+    float rh = 19;
+
+    static NodeState s24[TRACE_MAX_NODES];
     int k24 = tick_at(std::max(0.0, UI.t - MS_DAY));
     if (k24 != UI.s24_k) {
-        for (size_t n = 0; n < TR.nodes.size(); n++) node_state_at((int)n, k24, UI.s24[n]);
+        for (size_t n = 0; n < TR.nodes.size(); n++) node_state_at((int)n, k24, s24[n]);
         UI.s24_k = k24;
+        memcpy(UI.s24, s24, sizeof(s24));
     }
 
+    int rows = std::min((int)((r.height - 48) / rh), (int)TR.nodes.size());
     for (int n = 0; n < rows; n++) {
-        Rectangle row_r = { r.x, y - 1, r.width, rh };
+        Rectangle row_r = { r.x, y - 2, r.width, rh };
         bool hover = CheckCollisionPointRec(UI.mouse, row_r);
         if (n == UI.sel) DrawRectangleRec(row_r, Fade(COL_ACCENT, 0.12f));
-        else if (hover) DrawRectangleRec(row_r, Fade(COL_TEXT, 0.05f));
+        else if (hover) DrawRectangleRec(row_r, Fade(COL_TEXT, 0.045f));
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && hover) UI.sel = n;
 
         NodeState& st = FR.st[n];
         Node& nd = TR.nodes[n];
-        float x2 = r.x + 14;
-        int ci = 0;
-        DrawRectangle(x2 + cols[ci], y + 4, 9, 9, nd.color); ci++;
-        text(F13, x2 + cols[ci], y, nd.info.name, COL_TEXT); ci++;
+        char b[64];
+
+        DrawRectangle(colx[0], y + 4, 10, 10, nd.color);
+        text_trunc(F13, colx[1], y, nd.info.name, COL_TEXT, cols[1].w - 12);
+
         const char* sname = proc_name(st.proc_state);
         if (nd.info.type == T_TRUCK) sname = truck_name(st.truck_state);
         else if (nd.info.type == T_CONVEYOR) sname = conv_name(st.conv_state);
@@ -1265,25 +1514,25 @@ static void draw_table() {
         else if (nd.info.type == T_CHEM_SCRUM) sname = "S&OP";
         else if (nd.info.type == T_TAILINGS || nd.info.type == TRACE_NODE_ADDITIVE_STOCK) sname = "store";
         else if (nd.info.type == T_MINER) sname = "mining";
-        text(F13, x2 + cols[ci], y, sname, COL_DIM); ci++;
+        bool bad_state = !strcmp(sname, "DISRUPTED");
+        text_trunc(F13, colx[2], y, sname, bad_state ? COL_BAD : COL_DIM, cols[2].w - 12);
 
-        char b[64];
-        snprintf(b, sizeof b, "%.0f", st.mass_t() + st.belt_t());
-        text(F13, x2 + cols[ci], y, b, COL_TEXT); ci++;
+        snprintf(b, sizeof b, "%s", fmt_tons2(st.mass_t() + st.belt_t(), "").c_str());
+        text_r(F13, colx[3] + cols[3].w - 6, y, b, COL_TEXT);
         double tot = st.mass_t() + st.belt_t(), reo = 0;
         for (int e = 0; e < 5; e++) reo += st.m(e);
         snprintf(b, sizeof b, "%.1f", tot > 1 ? 100 * reo / tot : 0.0);
-        text(F13, x2 + cols[ci], y, b, COL_DIM); ci++;
-        snprintf(b, sizeof b, "%.0f", st.wip_t());
-        text(F13, x2 + cols[ci], y, b, st.wip_t() > 0 ? COL_WARN : COL_FAINT); ci++;
-        snprintf(b, sizeof b, "%.0f", st.out_t() + st.chem());
-        text(F13, x2 + cols[ci], y, b, st.out_t() > 0 ? COL_GOOD : COL_FAINT); ci++;
+        text_r(F13, colx[4] + cols[4].w - 6, y, b, COL_DIM);
+        snprintf(b, sizeof b, "%s", fmt_tons2(st.wip_t(), "").c_str());
+        text_r(F13, colx[5] + cols[5].w - 6, y, b, st.wip_t() > 0 ? COL_WARN : COL_FAINT);
+        snprintf(b, sizeof b, "%s", fmt_tons2(st.out_t() + st.chem(), "").c_str());
+        text_r(F13, colx[6] + cols[6].w - 6, y, b, st.out_t() > 0 ? COL_GOOD : COL_FAINT);
         snprintf(b, sizeof b, "%s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
-        text(F13, x2 + cols[ci], y, b, st.next_tick > UI.t ? COL_ACCENT : COL_FAINT); ci++;
+        text_r(F13, colx[7] + cols[7].w - 6, y, b, st.next_tick > UI.t ? COL_ACCENT : COL_FAINT);
 
         double d24 = st.level() - UI.s24[n].level();
         snprintf(b, sizeof b, "%+.0f", d24);
-        text(F13, x2 + cols[ci], y, b, d24 > 0.5 ? COL_GOOD : (d24 < -0.5 ? COL_BAD : COL_FAINT)); ci++;
+        text_r(F13, colx[8] + cols[8].w - 6, y, b, d24 > 0.5 ? COL_GOOD : (d24 < -0.5 ? COL_BAD : COL_FAINT));
         y += rh;
     }
     EndScissorMode();
@@ -1298,38 +1547,64 @@ static void draw_topbar() {
     DrawRectangleRec(r, COL_PANEL);
     DrawLine(0, r.y + r.height - 1, r.x + r.width, r.y + r.height - 1, COL_BORDER);
 
-    float x = 12, y = 11;
-    text(FB20, x, y - 3, "IMS-T8 · REE plant", COL_TEXT);
-    x += 225;
-
-    auto ib = [&](float bx, const char* lbl) { return button({ bx, y + 1, 36, 30 }, lbl, F16); };
-    if (ib(x, "|<")) { UI.t = TR.ticks[0] + 1; UI.playing = false; }
-    x += 41;
-    if (ib(x, "<"))  { UI.t = TR.ticks[std::max(0, UI.k - 1)] + 1; }
-    x += 41;
-    if (ib(x, UI.playing ? "||" : ">")) UI.playing = !UI.playing;
-    x += 41;
-    if (ib(x, ">|")) { UI.t = TR.ticks.back() - 1; UI.playing = false; }
-    x += 46;
-
-    if (button({ x, y + 1, 88, 30 }, SPEED_NAMES[UI.speed_idx], F16))
-        UI.speed_idx = (UI.speed_idx + 1) % 5;
-    x += 96;
-
+    float y = 12;
+    float x = 14;
     char b[96];
+
+    // ---- title zone
+    text(FB20, x, y + 1, "IMS-T8", COL_TEXT);
+    x += measure(FB20, "IMS-T8").x;
+    text(F13, x + 8, y + 12, "REE plant", COL_FAINT);
+    x += 8 + measure(F13, "REE plant").x + 14;
+    DrawLine(x, 8, x, r.height - 8, COL_BORDER);
+    x += 14;
+
+    // ---- transport zone (measured, never overlaps)
+    float by = y + 1, bh = 30;
+    bool hov[5];
+    for (int i = 0; i < 5; i++) {
+        Rectangle br = { x, by, 36, bh };
+        hov[i] = CheckCollisionPointRec(UI.mouse, br);
+        if (i == 2 && UI.playing) hov[i] = true;   // keep pause highlighted
+        if (icon_button(br, i == 2 && UI.playing ? 3 : i, hov[i])) {
+            switch (i) {
+                case 0: UI.t = TR.ticks[0] + 1; UI.playing = false; break;
+                case 1: UI.t = TR.ticks[std::max(0, UI.k - 1)]; UI.playing = false; break;
+                case 2: UI.playing = !UI.playing; break;
+                case 4: UI.t = TR.ticks[std::min((int)TR.ticks.size() - 1, UI.k + 1)]; UI.playing = false; break;
+                case 5: UI.t = TR.ticks.back() - 1; UI.playing = false; break;
+            }
+        }
+        x += 42;
+    }
+
+    // ---- speed
+    if (button({ x, by, 84, bh }, SPEED_NAMES[UI.speed_idx], F16))
+        UI.speed_idx = (UI.speed_idx + 1) % 5;
+    x += 84 + 12;
+    DrawLine(x, 8, x, r.height - 8, COL_BORDER);
+    x += 14;
+
+    // ---- clock zone
     snprintf(b, sizeof b, "%s", fmt_time((i64)UI.t).c_str());
     text(FB20, x, y, b, COL_PLAYHEAD);
-    x += measure(FB20, b).x + 16;
+    x += measure(FB20, b).x + 10;
     snprintf(b, sizeof b, "tick %d/%zu", UI.k, TR.ticks.size());
-    text(F13, x, y + 9, b, COL_DIM);
-    x += 118;
+    text(F13, x, y + 12, b, COL_DIM);
+    x += measure(F13, b).x + 14;
+    DrawLine(x, 8, x, r.height - 8, COL_BORDER);
+    x += 14;
 
+    // ---- KPI zone (measured, flows right)
     auto kpi = [&](const char* name, double v, Color c) {
-        snprintf(b, sizeof b, "%s %.0f t", name, v);
+        snprintf(b, sizeof b, "%s %s", name, fmt_tons2(v, "").c_str());
         Vector2 t2 = measure(F13, b);
-        DrawRectangle(x, y + 5, t2.x + 14, 22, Fade(c, 0.13f));
-        text(F13, x + 7, y + 9, b, c);
-        x += t2.x + 20;
+        float w = t2.x + 16;
+        if (x + w > GetScreenWidth() - 460) return;   // leave room for right-side buttons
+        DrawRectangle(x, y + 5, w, 22, Fade(c, 0.12f));
+        DrawRectangle(x, y + 5, 3, 22, c);
+        text(F13, x + 10, y + 9, b, c);
+        x += w + 8;
     };
     for (size_t n = 0; n < TR.nodes.size(); n++) {
         uint32_t ty = TR.nodes[n].info.type;
@@ -1339,21 +1614,23 @@ static void draw_topbar() {
         if (ty == T_CHEM_SRC)  kpi("acid", FR.st[n].chem(), COL_ACCENT);
     }
 
-    // right side buttons
-    float rx = GetScreenWidth() - 12;
-    snprintf(b, sizeof b, "%.0f fps", 1.0f / std::max(0.0001f, GetFrameTime()));
-    Vector2 fb = measure(F13, b);
-    text(F13, rx - fb.x, y + 9, b, COL_FAINT);
-    rx -= fb.x + 14;
-    if (button({ rx - 34, y + 1, 34, 30 }, "?", F16)) UI.show_help = !UI.show_help;
-    rx -= 40;
-    if (button({ rx - 78, y + 1, 78, 30 }, "reload", F13)) UI.reload_request = 1;
-    rx -= 84;
-    if (button({ rx - 72, y + 1, 72, 30 }, "evt >", F13)) {
+    // ---- right-side zone
+    float rx = GetScreenWidth() - 14;
+    if (!LY.screenshot_mode) {
+        snprintf(b, sizeof b, "%.0f fps", 1.0f / std::max(0.0001f, GetFrameTime()));
+        Vector2 fb2 = measure(F13, b);
+        text(F13, rx - fb2.x, y + 11, b, COL_FAINT);
+        rx -= fb2.x + 12;
+    }
+    if (button({ rx - 34, by, 34, bh }, "?", F16)) UI.show_help = !UI.show_help;
+    rx -= 34 + 8;
+    if (button({ rx - 76, by, 76, bh }, "reload", F13)) UI.reload_request = 1;
+    rx -= 76 + 8;
+    if (button({ rx - 66, by, 66, bh }, "evt >", F13)) {
         for (auto& mk : TR.marks) if (mk.t0 > UI.t + 1) { UI.t = mk.t0 + 1; break; }
     }
-    rx -= 76;
-    if (button({ rx - 72, y + 1, 72, 30 }, "< evt", F13)) {
+    rx -= 66 + 8;
+    if (button({ rx - 66, by, 66, bh }, "< evt", F13)) {
         i64 best = -1;
         for (auto& mk : TR.marks) if (mk.t0 < UI.t - 1) best = std::max(best, mk.t0);
         if (best >= 0) UI.t = best + 1;
@@ -1369,50 +1646,43 @@ static void draw_graph() {
     DrawRectangleRec(r, COL_BG);
     BeginScissorMode((int)r.x, (int)r.y, (int)r.width, (int)r.height);
 
-    // grid dots
-    float gs = 56 * UI.zoom;
-    if (gs > 18)
-        for (float gx = fmodf(-UI.cam.x * UI.zoom, gs); gx < r.width; gx += gs)
-            for (float gy = fmodf(-UI.cam.y * UI.zoom, gs); gy < r.height; gy += gs)
-                DrawPixel((int)(r.x + gx), (int)(r.y + gy), Fade(COL_BORDER, 0.6f));
-
-    int mine = -1, truck = -1;
+    int mine = -1, truck = -1, crusher = -1;
     for (size_t i = 0; i < TR.nodes.size(); i++) {
         uint32_t t = TR.nodes[i].info.type;
         if (t == T_MINER) mine = (int)i;
         if (t == T_TRUCK) truck = (int)i;
+        if (t == T_CRUSHER) crusher = (int)i;
     }
 
-    // edges (skip mine→truck / truck→crusher: drawn as the road)
+    // edges first (skip the mine/truck legs: the road covers them)
     for (size_t i = 0; i < TR.nodes.size(); i++) {
         Node& nd = TR.nodes[i];
         if (nd.info.output < 0) continue;
         if ((int)i == mine || (int)i == truck) continue;
         Node& out = TR.nodes[nd.info.output];
         bool info_edge = (nd.info.type == T_CHEM_SRC);
-        // recent flow → brighter (tons arrived in the last 2 days, up to now)
         double recent = 0;
         {
             auto it = std::upper_bound(nd.inflow.begin(), nd.inflow.end(), UI.t,
                 [](double t, const InflowEvent& e) { return t < (double)e.t; });
-            for (auto j = it; j-- != nd.inflow.begin() && j->t > UI.t - 2 * MS_DAY; )
+            for (auto j = it; j-- > nd.inflow.begin();) {
+                if (j->t <= UI.t - 2 * MS_DAY) break;
                 recent += j->tons;
+            }
         }
         float glow = (float)clampd(recent / 200.0, 0.0, 1.0);
-        Color c = Fade(info_edge ? COL_ACCENT : out.color, 0.35f + 0.55f * glow);
+        Color c = Fade(info_edge ? COL_ACCENT : out.color, 0.4f + 0.5f * glow);
         draw_edge((int)i, nd.info.output, c, info_edge ? 1.5f : 2.5f + 2 * glow, info_edge);
     }
 
-    // truck + road
+    if (mine >= 0 && crusher >= 0) draw_road(mine, crusher);
     if (truck >= 0) draw_truck(truck);
 
-    // nodes (truck node drawn as the glyph above; skip its box)
     for (size_t i = 0; i < TR.nodes.size(); i++) {
         if ((int)i == truck) continue;
         draw_node((int)i);
     }
 
-    // particles along edges
     for (auto& p : PARTS) {
         Vector2 pts[4];
         edge_route(p.edge, TR.nodes[p.edge].info.output, pts);
@@ -1427,7 +1697,6 @@ static void draw_graph() {
 // ============================================================================
 
 static void handle_input(float dt) {
-    // ---- keyboard -----------------------------------------------------------
     if (IsKeyPressed(KEY_SPACE)) UI.playing = !UI.playing;
     if (IsKeyPressed(KEY_LEFT)) {
         UI.playing = false;
@@ -1437,9 +1706,8 @@ static void handle_input(float dt) {
         UI.playing = false;
         UI.t = IsKeyDown(KEY_LEFT_SHIFT) ? UI.t + MS_DAY : (double)TR.ticks[std::min((int)TR.ticks.size() - 1, UI.k + 1)];
     }
-    if (IsKeyPressed(KEY_PAGE_DOWN)) {
+    if (IsKeyPressed(KEY_PAGE_DOWN))
         for (auto& mk : TR.marks) if (mk.t0 > UI.t + 1) { UI.t = mk.t0 + 1; break; }
-    }
     if (IsKeyPressed(KEY_PAGE_UP)) {
         i64 best = -1;
         for (auto& mk : TR.marks) if (mk.t0 < UI.t - 1) best = std::max(best, mk.t0);
@@ -1452,27 +1720,34 @@ static void handle_input(float dt) {
     if (IsKeyPressed(KEY_F11)) ToggleFullscreen();
     if (IsKeyPressed(KEY_ESCAPE)) exit(0);
 
-    // ---- timeline scrub -------------------------------------------------------
-    Rectangle tr = LY.timeline;
-    bool over_tl = CheckCollisionPointRec(UI.mouse, tr);
     float wheel = GetMouseWheelMove();
 
+    // ---- inspector scroll -----------------------------------------------------
+    if (wheel != 0 && CheckCollisionPointRec(UI.mouse, LY.inspector) && UI.sel >= 0) {
+        float visible = LY.inspector.height - 20;
+        float max_scroll = std::max(0.0f, UI.insp_h - visible);
+        UI.insp_scroll = clampd(UI.insp_scroll - wheel * 36, 0, max_scroll);
+    }
+
+    // ---- timeline scrub ------------------------------------------------------
+    Rectangle tr = LY.timeline;
+    bool over_tl = CheckCollisionPointRec(UI.mouse, tr);
+
     if (over_tl && wheel != 0 && !IsKeyDown(KEY_LEFT_SHIFT)) {
-        // zoom at cursor
         double ct = tl_x_to_t(UI.mouse.x);
         double span = (UI.vw1t - UI.vw0t) / (wheel > 0 ? 1.35 : 1 / 1.35);
         span = clampd(span, MS_HOUR, TR.t_end);
         UI.vw0t = clampd(ct - (ct - UI.vw0t) / (UI.vw1t - UI.vw0t) * span, 0, TR.t_end - span);
         UI.vw1t = UI.vw0t + span;
     }
-
     if (over_tl && wheel != 0 && IsKeyDown(KEY_LEFT_SHIFT)) {
         double pan = (UI.vw1t - UI.vw0t) * 0.15 * (wheel > 0 ? -1 : 1);
         UI.vw0t = clampd(UI.vw0t + pan, 0, TR.t_end - (UI.vw1t - UI.vw0t));
         UI.vw1t = UI.vw0t + (UI.vw1t - UI.vw0t);
     }
 
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && over_tl) {
+    bool over_minimap = LY.tl_minimap.width > 0 && CheckCollisionPointRec(UI.mouse, LY.tl_minimap);
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && over_tl && !over_minimap) {
         UI.scrubbing = true;
         UI.playing = false;
         UI.scrub_v = 0;
@@ -1488,10 +1763,6 @@ static void handle_input(float dt) {
             if (fabs(UI.scrub_v) < MS_MIN) { UI.scrubbing = false; UI.scrub_v = 0; }
         }
     }
-    if (over_tl && IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) { }   // reserved
-    if (over_tl && IsMouseButtonPressed(MOUSE_MIDDLE_BUTTON)) { } // reserved
-
-    // double click = fit
     if (over_tl) {
         static double last_click = -1;
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
@@ -1500,13 +1771,13 @@ static void handle_input(float dt) {
         }
     }
 
-    // ---- graph pan / zoom / select -------------------------------------------
+    // ---- graph pan / zoom / select ---------------------------------------------
     Rectangle gr = LY.graph;
     bool over_gr = CheckCollisionPointRec(UI.mouse, gr);
     if (over_gr && wheel != 0) {
         Vector2 before = screen_to_world(UI.mouse);
-        UI.zoom_t = clampd(UI.zoom_t * (wheel > 0 ? 1.15f : 1 / 1.15f), 0.25f, 4.0f);
-        UI.zoom = UI.zoom_t;   // instant zoom, keeps cursor anchored
+        UI.zoom_t = clampd(UI.zoom_t * (wheel > 0 ? 1.15 : 1 / 1.15), 0.75, 2.6);
+        UI.zoom = UI.zoom_t;
         Vector2 after = screen_to_world(UI.mouse);
         UI.cam_t.x += before.x - after.x; UI.cam_t.y += before.y - after.y;
         UI.cam = UI.cam_t;
@@ -1517,15 +1788,14 @@ static void handle_input(float dt) {
         for (int pass = 0; pass < 2 && UI.hover < 0; pass++)
             for (size_t i = 0; i < TR.nodes.size(); i++) {
                 Node& nd = TR.nodes[i];
-                if (pass == 0 && nd.info.type == T_TRUCK) continue;   // trucks hit via glyph
+                if (pass == 0 && nd.info.type == T_TRUCK) continue;
                 if (pass == 1 && nd.info.type != T_TRUCK) continue;
                 Rectangle nr = (nd.info.type == T_TRUCK)
-                    ? Rectangle{ truck_pos((int)i).x - 20, truck_pos((int)i).y - 34, 40, 46 }
+                    ? Rectangle{ truck_pos((int)i).x - 24, truck_pos((int)i).y - 42, 48, 56 }
                     : node_rect((int)i);
                 if (CheckCollisionPointRec(UI.mouse, nr)) { UI.hover = (int)i; break; }
             }
         if (UI.hover >= 0) {
-            // tooltip
             NodeState& st = FR.st[UI.hover];
             snprintf(UI.tooltip, sizeof UI.tooltip,
                      "%s\nstock %.1f t · wip %.1f t · out %.1f t\nstate %s · next event %s",
@@ -1538,7 +1808,7 @@ static void handle_input(float dt) {
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && over_gr) {
         if (UI.hover >= 0) {
             UI.sel = UI.hover;
-            if (TR.nodes[UI.hover].draggable) { UI.drag_node = UI.hover; }
+            if (TR.nodes[UI.hover].draggable) UI.drag_node = UI.hover;
         } else {
             UI.pan_graph = true;
             UI.pan_grab = UI.mouse;
@@ -1566,35 +1836,33 @@ static void handle_input(float dt) {
 
 static void draw_help() {
     if (!UI.show_help) return;
-    Rectangle r = { GetScreenWidth() / 2.0f - 330, GetScreenHeight() / 2.0f - 240, 660, 480 };
-    (void)0;
-    DrawRectangleRec(r, { 16, 20, 27, 248 });
+    Rectangle r = { GetScreenWidth() / 2.0f - 340, GetScreenHeight() / 2.0f - 250, 680, 500 };
+    DrawRectangleRec(r, { 16, 20, 27, 250 });
     DrawRectangleLinesEx(r, 1, COL_ACCENT);
     float x = r.x + 20, y = r.y + 16;
     text(FB20, x, y, "Controls & legend", COL_TEXT); y += 32;
     const char* lines[] = {
-        "timeline   drag = scrub (with inertia)    wheel = zoom at cursor",
-        "           shift+wheel = pan    double-click = fit whole run",
-        "           hover = crosshair + values tooltip",
-        "graph      click node = inspect    drag node = move",
-        "           drag background = pan    wheel = zoom",
-        "table      click row = inspect that node",
+        "timeline    drag = scrub (with inertia)     wheel = zoom at cursor",
+        "            shift+wheel = pan    double-click = fit whole run",
+        "            hover = crosshair + values tooltip",
+        "graph       click node = inspect     drag node = move",
+        "            drag background = pan     wheel = zoom",
+        "table       click row = inspect that node",
         "",
-        "space play/pause    ←/→ step one tick    shift+←/→ step one day",
-        "PgUp/PgDn  jump to previous/next notable event",
+        "space play/pause     <- -> step one tick     shift + <- -> step one day",
+        "PgUp/PgDn jump to previous/next notable event",
         "[ ] playback speed   R reload trace   F11 fullscreen   Esc quit",
         "",
         "mark lanes under the timeline:",
-        "  amber    mine pad empty (< 20 t)",
-        "  blue     acid tank low (< 50 t)",
-        "  orange   flotation starved (idle, no feed)",
-        "  red      acid supply market disruption",
-        "  cyan     S&OP scrum (contract revision)",
-        "  green    flotation campaign start",
+        "  amber     mine pad empty (< 20 t)",
+        "  blue      acid tank low (< 50 t)",
+        "  orange    flotation starved (idle, no feed)",
+        "  red       acid supply market disruption",
+        "  cyan      S&OP scrum (contract revision)",
+        "  green     flotation campaign start",
         "",
-        "the chart on the timeline shows every node's stock, each",
-        "normalized to its own maximum — shapes, not absolute values.",
-        "click a node to make its envelope stand out.",
+        "the chart shows every node's stock, each normalized to its own",
+        "maximum: shapes, not absolute values. click a node to highlight it.",
     };
     for (auto& l : lines) { text(F13, x, y, l, COL_DIM); y += 17; }
 }
@@ -1604,13 +1872,13 @@ static void draw_help() {
 // ============================================================================
 
 static double parse_time_arg(const char* s, i64 t_end) {
-    if (!strcmp(s, "end")) return t_end;
+    if (!strcmp(s, "end")) return (double)t_end;
     char* endp = nullptr;
     double v = strtod(s, &endp);
     if (endp && *endp == 'd') return v * MS_DAY;
     if (endp && *endp == 'h') return v * MS_HOUR;
     if (endp && *endp == 'y') return v * 365 * MS_DAY;
-    return v;   // raw ms
+    return v;
 }
 
 int main(int argc, char** argv) {
@@ -1619,10 +1887,13 @@ int main(int argc, char** argv) {
     const char* sel_name = nullptr;
     const char* at_arg = nullptr;
     bool dump = false;
+    int smoke_frames = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--sel") && i + 1 < argc) sel_name = argv[++i];
         else if (!strcmp(argv[i], "--dump")) dump = true;
+        else if (!strcmp(argv[i], "--smoke") && i + 1 < argc) smoke_frames = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--smoke")) smoke_frames = 300;
         else if (!strcmp(argv[i], "--at") && i + 1 < argc) at_arg = argv[++i];
         else path = argv[i];
     }
@@ -1631,25 +1902,30 @@ int main(int argc, char** argv) {
     InitWindow(1800, 1000, "IMS-T8 · simulation viewer");
     SetTargetFPS(60);
     load_fonts();
+    LY.compute();
+    LY.screenshot_mode = shot != nullptr;
 
     if (!load_trace(path)) { fprintf(stderr, "failed to load %s\n", path); return 1; }
 
     double shot_at = at_arg ? parse_time_arg(at_arg, TR.t_end) : -1;
-    UI.vw0 = UI.vw1 = 0; UI.vw0t = 0; UI.vw1t = TR.t_end;
-    UI.vw1 = TR.t_end;
-    UI.t = shot_at >= 0 ? clampd(shot_at, 0, TR.t_end) : TR.ticks[0] + 1;
-    LY.compute();
+    UI.vw0 = 0; UI.vw1 = TR.t_end;
+    UI.vw0t = 0; UI.vw1t = TR.t_end;
+    UI.t = shot_at >= 0 ? clampd(shot_at, 0, (double)TR.t_end) : TR.ticks[0] + 1;
     default_layout();
     build_frame(UI.t);
     UI.k = FR.k;
     UI.sel = -1;
 
-    if (sel_name)
+    if (sel_name) {
         for (size_t i = 0; i < TR.nodes.size(); i++)
             if (!strcmp(TR.nodes[i].info.name, sel_name)) UI.sel = (int)i;
+    } else {
+        // pre-select the most information-rich node so the inspector shows data
+        for (size_t i = 0; i < TR.nodes.size(); i++)
+            if (TR.nodes[i].info.type == T_FLOTATION) UI.sel = (int)i;
+    }
 
     if (dump) {
-        build_frame(UI.t);
         printf("--- state at %s (tick %d) ---\n", fmt_time((i64)UI.t).c_str(), FR.k);
         for (size_t i = 0; i < TR.nodes.size(); i++) {
             NodeState& st = FR.st[i];
@@ -1661,17 +1937,15 @@ int main(int argc, char** argv) {
     }
 
     if (shot) {
-        // single-frame render for testing / automation
         UI.tooltip[0] = 0;
         build_frame(UI.t);
         BeginDrawing();
         ClearBackground(COL_BG);
         LY.compute();
         draw_topbar(); draw_timeline(); draw_graph(); draw_inspector(); draw_table();
-        rlDrawRenderBatchActive();          // flush the shape batch to the GPU
-        TakeScreenshot("_viewer_shot.png"); // raylib strips directories, save in CWD
+        rlDrawRenderBatchActive();
+        TakeScreenshot("_viewer_shot.png");
         EndDrawing();
-        // move to the requested path
         {
             FILE* in = fopen("_viewer_shot.png", "rb");
             FILE* out = fopen(shot, "wb");
@@ -1687,8 +1961,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    UI.playing = smoke_frames > 0;
+    int frames = 0;
     while (!WindowShouldClose()) {
-        float dt = GetFrameTime();
+        if (smoke_frames && ++frames > smoke_frames) break;
+        float dt = smoke_frames ? 1 / 60.0f : GetFrameTime();
         UI.mouse = GetMousePosition();
         UI.tooltip[0] = 0;
 
@@ -1697,7 +1974,7 @@ int main(int argc, char** argv) {
             size_t old_sel = UI.sel < 0 ? 0 : (size_t)UI.sel;
             if (load_trace(TR.path)) {
                 UI.vw1t = TR.t_end;
-                FR.k = -2; FR.valid = false;      // data changed: rebuild states
+                FR.k = -2; FR.valid = false;
                 UI.s24_k = -3;
                 build_frame(UI.t);
                 UI.sel = (int)std::min(old_sel, TR.nodes.size() - 1);
@@ -1707,7 +1984,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // playback
         if (UI.playing && !UI.scrubbing) {
             UI.t += SPEEDS[UI.speed_idx] * dt;
             if (UI.t >= TR.t_end) { UI.t = TR.t_end; UI.playing = false; }
@@ -1715,7 +1991,6 @@ int main(int argc, char** argv) {
 
         handle_input(dt);
 
-        // animated values
         UI.vw0 = UI.vw0 + (UI.vw0t - UI.vw0) * clampd(dt * 14, 0, 1);
         UI.vw1 = UI.vw1 + (UI.vw1t - UI.vw1) * clampd(dt * 14, 0, 1);
 
