@@ -31,7 +31,7 @@ for i in range(node_count):
 # state per node
 S = [dict(mass=[0.0]*6, wip=[0.0]*6, out=[0.0]*6, belt=[0.0]*36, chem=0.0,
           next_tick=0, belt_head=0, proc=0, truck=0, conv=0, cars=0, burned=0.0,
-          b_scrum=0.0, l_scrum=0, disrupt=-1) for _ in range(node_count)]
+          b_scrum=0.0, l_scrum=0, disrupt=-1, flow_in=0.0, flow_out=0.0) for _ in range(node_count)]
 
 def slot(st, s):
     if s < 6: return st["mass"], s
@@ -64,6 +64,8 @@ try:
             if smask & (1<<7): st["l_scrum"], = take("<q")
             if smask & (1<<8): st["disrupt"], = take("<q")
             if smask & (1<<9): st["belt_head"], = take("<i")
+            if smask & (1<<10): st["flow_in"], = take("<f")
+            if smask & (1<<11): st["flow_out"], = take("<f")
             for s in range(55):
                 if mmask & (1<<s):
                     v, = take("<f")
@@ -77,6 +79,10 @@ except Exception as e:
 DAY = 86_400_000
 print(f"\nticks={nticks} first_day={t_first/DAY:.1f} last_day={last_time/DAY:.1f}")
 tot = lambda st: sum(st["mass"]) + sum(st["wip"]) + sum(st["out"]) + sum(st["belt"]) + st["chem"]
+print("\nexact cumulative flow_in (t):")
+for i, n in enumerate(nodes):
+    fi = S[i].get("flow_in", 0.0)
+    if fi > 0: print(f"  {n['name']:20s} {fi:10.0f}")
 print("\nfinal state (should match the sim's console report at day 1824):")
 for i, n in enumerate(nodes):
     st = S[i]

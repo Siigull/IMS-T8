@@ -24,6 +24,11 @@ every node field that changed since the previous tick is delta-encoded:
   (La, Ce, Pr, Nd, Dy + waste), as f32,
 - machine states (`proc_state`, `truck_state`, `conv_state`), `next_tick`,
   belt head, chem contract (`cars`, `burned`, scrum bookkeeping),
+- **exact per-node flow counters** (v2): cumulative tons moved in/out by
+  transactions (the miner's production counts as inflow from the virtual
+  deposit). These give exact edge throughput, "arrived to date" KPIs and the
+  table's `t / 24h` column — stock-level differencing alone cannot separate an
+  arrival from a departure inside one tick.
 - the world-global `chem_disrupted_until` (on the market node),
 - which nodes' `tick()` bodies ran at that time (activity info),
 - `g_additives` as a pseudo node ("Additive stock").
@@ -37,6 +42,12 @@ the writer in `sim_trace.h` and the viewer). Layout in short: gzip of
 `[TraceFileHeader][NodeInfo × N]` followed by a stream of
 `[TickHeader][NodeDelta × dirty]` records, all little-endian, packed.
 `tools/validate_trace.py` is an independent Python reference parser.
+
+A note on verification: the trace tooling cross-checks mass conservation
+(production = truck hauls = plant inventory, to the tonne). Building it found
+and fixed a real sim bug — the miner's arrival code used
+`reo += elem[el] += ...`, which double-counts the pad's existing REO and
+subtracted it from the waste gain, silently destroying ~0.7 % of production.
 
 ## The viewer
 
@@ -60,7 +71,7 @@ the writer in `sim_trace.h` and the viewer). Layout in short: gzip of
 │  mine→plant road, flow particles       │                              │
 ├───────────────────────────────────────┴──────────────────────────────┤
 │ table        one row per node: state · stocks · grade · next event ·  │
-│              Δ24h                                                     │
+│              t/24h throughput                                          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -118,7 +129,9 @@ find when/why anything happened; clicking a node gives its full history.
 - **New per-tick fields**: add a scalar bit in `trace_format.h`
   (`TR_SC_*`), emit it in `sim_trace.h` (compare-and-delta), bump
   `TRACE_VERSION`, read it in `viewer.cpp::apply_delta`, and expose it in the
-  inspector.
+  inspector. Cumulative counters (like the flows) delta-encode perfectly;
+  per-tick ephemeral values do not (equal consecutive values would be
+  skipped) — make them monotonic.
 - **Format changes** are versioned; the viewer refuses mismatched versions.
 
 ### raylib

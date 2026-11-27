@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define TRACE_MAGIC       "IMSTRC01"   // 8 bytes
-#define TRACE_VERSION     1
+#define TRACE_VERSION     2
 
 // Bitmasks are u64 → at most 64 logged nodes (sim asserts on more).
 #define TRACE_MAX_NODES   64
@@ -54,6 +54,8 @@ enum {
     TR_SC_DISRUPTED_UNTIL     = 8,   // i64  (world global, logged on the
                                       //        N_CHEM_DISRUPTION node)
     TR_SC_BELT_HEAD           = 9,   // i32
+    TR_SC_FLOW_IN             = 10,  // f32  tons moved INTO this node this tick
+    TR_SC_FLOW_OUT            = 11,  // f32  tons moved OUT of this node this tick
     TR_SC_COUNT
 };
 #define TRACE_SCALAR_ALL   0xFFFFu

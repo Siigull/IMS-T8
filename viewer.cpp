@@ -100,6 +100,7 @@ struct NodeState {
     i64   next_tick = 0, chem_last_scrum = 0, disrupted_until = -1;
     int32_t chem_cars = 0, belt_head = 0;
     float chem_burned = 0, chem_burned_at_scrum = 0;
+    float flow_in_tot = 0, flow_out_tot = 0;   // cumulative tons moved (monotonic counters)
     uint8_t proc_state = 0, truck_state = 0, conv_state = 0;
 
     void zero() { memset(this, 0, sizeof(*this)); disrupted_until = -1; }
@@ -140,6 +141,7 @@ struct Node {
 
     NodeSeries series[NB];
     std::vector<InflowEvent> inflow;
+    std::vector<double> inflow_prefix;        // prefix sum of tons, aligned with inflow[]
     std::vector<StateChange> state_changes;
     double cum_in = 0;                        // total tons ever arrived
 };
@@ -183,6 +185,8 @@ static size_t apply_delta(NodeState& s, const uint8_t* p) {
     if (smask & (1u << TR_SC_CHEM_LAST_SCRUM))      { memcpy(&s.chem_last_scrum, p, 8); p += 8; n += 8; }
     if (smask & (1u << TR_SC_DISRUPTED_UNTIL))      { memcpy(&s.disrupted_until, p, 8); p += 8; n += 8; }
     if (smask & (1u << TR_SC_BELT_HEAD))            { memcpy(&s.belt_head, p, 4); p += 4; n += 4; }
+    if (smask & (1u << TR_SC_FLOW_IN))              { memcpy(&s.flow_in_tot, p, 4); p += 4; n += 4; }
+    if (smask & (1u << TR_SC_FLOW_OUT))             { memcpy(&s.flow_out_tot, p, 4); p += 4; n += 4; }
     for (int i = 0; i < TRACE_MASS_SLOTS; i++)
         if (mmask & (1ull << i)) { memcpy(&s.mass[i], p, 4); p += 4; n += 4; }
     return n;
@@ -294,12 +298,19 @@ static bool load_trace(const char* path) {
             if (nd.dtick.size() % CKPT == 0) nd.ckpt.push_back(run[i]);
 
             // ---- events ---------------------------------------------------
+            // flow counters are cumulative: per-tick flow is the diff. For stocks
+            // that fill without transactions (acid deliveries) fall back to the
+            // net level jump.
             double lv = run[i].level();
             double jump = lv - prev_level[i];
-            if (jump > 1.0) {
-                nd.inflow.push_back({ time, (float)jump });
-                nd.cum_in += jump;
-                bucket_tons[i] += jump;
+            double tick_in = run[i].flow_in_tot - before.flow_in_tot;
+            double tick_out = run[i].flow_out_tot - before.flow_out_tot;
+            // transfers in > production in (sources) > net level jump (tank fills)
+            double arrived = tick_in > 0.01 ? tick_in : (jump > 1.0 ? jump : 0);
+            if (arrived > 1.0) {
+                nd.inflow.push_back({ time, (float)arrived });
+                nd.cum_in += arrived;
+                bucket_tons[i] += arrived;
             }
             prev_level[i] = lv;
 
@@ -367,6 +378,17 @@ static bool load_trace(const char* path) {
         if (pred[k] >= 0 && !TR.ticks.empty())
             TR.marks.push_back({ TR.ticks[pred[k]], TR.t_end, k });
 
+    // inflow prefix sums (for "arrived to date" values at any playhead)
+    for (auto& nd : TR.nodes) {
+        nd.inflow_prefix.resize(nd.inflow.size() + 1);
+        double acc = 0;
+        nd.inflow_prefix[0] = 0;
+        for (size_t i = 0; i < nd.inflow.size(); i++) {
+            acc += nd.inflow[i].tons;
+            nd.inflow_prefix[i + 1] = acc;
+        }
+    }
+
     std::sort(TR.marks.begin(), TR.marks.end(),
               [](const Mark& a, const Mark& b) { return a.t0 < b.t0; });
 
@@ -376,6 +398,14 @@ static bool load_trace(const char* path) {
            raw.size() / 1048576.0, GetTime() - t0);
     if (TR.truncated) printf("[viewer] warning: trace ended mid-record (sim killed while writing?)\n");
     return TR.ticks.size() > 1;
+}
+
+// tons arrived at this node up to time t
+static double cum_in_at(Node& nd, double t) {
+    if (nd.inflow.empty()) return 0;
+    auto it = std::upper_bound(nd.inflow.begin(), nd.inflow.end(), t,
+        [](double tt, const InflowEvent& e) { return tt < (double)e.t; });
+    return nd.inflow_prefix[it - nd.inflow.begin()];
 }
 
 // ============================================================================
@@ -533,6 +563,13 @@ static void text_r(Fnt f, float xr, float y, const char* s, Color c) {
     text(f, xr - measure(f, s).x, y, s, c);
 }
 
+// next-event label: future -> duration, past -> overdue, none -> never
+static std::string fmt_next(i64 next, double now) {
+    if (next <= 0) return "never";
+    if ((double)next < now) return "overdue";
+    return fmt_dur(next - (i64)now);
+}
+
 // tonnage with thousands separators: "541,347 t"
 static std::string fmt_tons2(double v, const char* unit = " t") {
     char buf[48];
@@ -685,17 +722,18 @@ static void default_layout() {
         if (n.info.type == T_TAILINGS)  n.size = { 200, 156 };
         if (n.info.type == T_CHEM_SRC)  n.size = { 232, 132 };
         if (n.info.type == T_CHEM_DISRUPTION) n.size = { 208, 74 };
+        if (n.info.type == T_CHEM_SCRUM) n.size = { 210, 108 };
         if (n.info.type == TRACE_NODE_ADDITIVE_STOCK) n.size = { 208, 74 };
-        if      (!strcmp(name, "Mine"))           n.pos = { 40, 330 };
-        else if (!strcmp(name, "Haul truck"))     n.pos = { 250, 470 };
-        else if (!strcmp(name, "Crusher"))       n.pos = { 430, 330 };
-        else if (!strcmp(name, "Belt conveyor"))  n.pos = { 720, 342 };
-        else if (!strcmp(name, "Flotation"))      n.pos = { 1050, 312 };
-        else if (!strcmp(name, "Tailings dam"))   n.pos = { 1350, 302 };
-        else if (!strcmp(name, "Chem market"))    n.pos = { 470, 30 };
-        else if (!strcmp(name, "Acid supplier"))  n.pos = { 50, 110 };
-        else if (!strcmp(name, "Acid S&OP"))      n.pos = { 420, 116 };
-        else if (!strcmp(name, "Additive stock")) n.pos = { 800, 30 };
+        if      (!strcmp(name, "Mine"))           n.pos = { 40, 420 };
+        else if (!strcmp(name, "Haul truck"))     n.pos = { 250, 560 };
+        else if (!strcmp(name, "Crusher"))       n.pos = { 430, 420 };
+        else if (!strcmp(name, "Belt conveyor"))  n.pos = { 720, 432 };
+        else if (!strcmp(name, "Flotation"))      n.pos = { 1050, 402 };
+        else if (!strcmp(name, "Tailings dam"))   n.pos = { 1350, 392 };
+        else if (!strcmp(name, "Chem market"))    n.pos = { 60, 64 };
+        else if (!strcmp(name, "Acid supplier"))  n.pos = { 400, 48 };
+        else if (!strcmp(name, "Acid S&OP"))      n.pos = { 400, 220 };
+        else if (!strcmp(name, "Additive stock")) n.pos = { 60, 190 };
         else {  // unknown node: auto grid on the right
             int col = (int)i % 2, row = (int)i / 2;
             n.pos = { 1620.f + col * 230, 60.f + row * 170 };
@@ -806,7 +844,7 @@ static void draw_road(int mine, int crusher) {
     DrawLineEx(p0, p1, 3, rc); DrawLineEx(p1, p2, 3, rc); DrawLineEx(p2, p3, 3, rc);
     // direction chevrons
     for (float x = p1.x + 14; x < p2.x - 16; x += 34) {
-        DrawTriangle({ x, ry - 6 }, { x, ry + 6 }, { x + 9, ry }, Fade(COL_FAINT, 0.5f));
+        DrawTriangle({ x, ry - 6 }, { x, ry + 6 }, { x + 9, ry }, Fade(COL_DIM, 0.85f));
     }
     // dock stubs into the cards
     DrawLineEx({ a.x - 5, a.y + 6 }, { a.x + 5, a.y + 6 }, 3, rc);
@@ -915,9 +953,13 @@ static void draw_node(int n) {
         DrawRectangle(ix + iw - tw, y - 2, tw, fh, COL_PANEL2);
         double u = clampd(st.chem() / (double)nd.info.mass_capacity, 0, 1);
         if (u > 0.005) DrawRectangle(ix + iw - tw + 2, y - 2 + fh * (1 - (float)u) + 2, tw - 4, fh * (float)u - 4, Fade(nd.color, 0.6f));
-        // target line at 200/400
+        // capacity ticks + target line at 50%
+        for (int q = 1; q <= 3; q++) {
+            float qy = y - 2 + fh * (1 - q / 4.0f);
+            DrawLine(ix + iw - tw, qy, ix + iw - tw + 5, qy, Fade(COL_TEXT, 0.25f));
+        }
         float ty = y - 2 + fh * (1 - 0.5f);
-        DrawLine(ix + iw - tw, ty, ix + iw, ty, Fade(COL_TEXT, 0.25f));
+        DrawLine(ix + iw - tw, ty, ix + iw, ty, Fade(COL_TEXT, 0.35f));
         float vw = iw - tw - 14;
         snprintf(b, sizeof b, "%s", fmt_tons2(st.chem()).c_str());
         stat_line(ix, y, vw, "tank", b, st.chem() < 50 ? COL_BAD : COL_TEXT, st.chem(), nd.info.mass_capacity, nd.color);
@@ -931,11 +973,27 @@ static void draw_node(int n) {
             snprintf(b, sizeof b, "%s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
             text(F13, ix, y + 72, "next delivery", COL_FAINT); text_r(F13, ix + vw, y + 73, b, COL_DIM);
         }
+    } else if (nd.info.type == T_CHEM_SCRUM) {
+        int sup = -1;
+        for (size_t i = 0; i < TR.nodes.size(); i++) if (TR.nodes[i].info.type == T_CHEM_SRC) sup = (int)i;
+        snprintf(b, sizeof b, "%d cars", sup >= 0 ? FR.st[sup].chem_cars : 0);
+        text(F13, ix, y, "contract", COL_FAINT); text_r(F13, ix + iw, y, b, COL_TEXT); y += 22;
+        snprintf(b, sizeof b, "%s ago", fmt_dur((i64)UI.t - st.chem_last_scrum).c_str());
+        text(F13, ix, y, "last scrum", COL_FAINT); text_r(F13, ix + iw, y, b, COL_DIM); y += 22;
+        snprintf(b, sizeof b, "%s", fmt_tons2(st.chem_burned_at_scrum).c_str());
+        text(F13, ix, y, "burn @ scrum", COL_FAINT); text_r(F13, ix + iw, y, b, COL_DIM); y += 22;
+        snprintf(b, sizeof b, "next %s", fmt_next(st.next_tick, UI.t).c_str());
+        text(F13, ix, y, b, COL_ACCENT);
     } else if (nd.info.type == T_CHEM_DISRUPTION || nd.info.type == TRACE_NODE_ADDITIVE_STOCK) {
         if (nd.info.type == TRACE_NODE_ADDITIVE_STOCK) {
-            snprintf(b, sizeof b, "%s", fmt_tons2(st.mass_t()).c_str());
-            text(F13, ix, y, "imported", COL_FAINT); text_r(F13, ix + iw, y, b, COL_TEXT);
-            draw_elem_bar(ix, y + 22, iw, 6, st.mass);
+            if (st.mass_t() > 0.01) {
+                snprintf(b, sizeof b, "%s", fmt_tons2(st.mass_t()).c_str());
+                text(F13, ix, y, "imported", COL_FAINT); text_r(F13, ix + iw, y, b, COL_TEXT);
+                draw_elem_bar(ix, y + 22, iw, 6, st.mass);
+            } else {
+                text(F13, ix, y, "no deliveries yet", COL_FAINT);
+                text(F13, ix, y + 17, "awaiting consumer", COL_FAINT);
+            }
         } else {
             if (st.disrupted_until > UI.t) {
                 snprintf(b, sizeof b, "%s left", fmt_dur(st.disrupted_until - (i64)UI.t).c_str());
@@ -968,7 +1026,7 @@ static void draw_node(int n) {
         for (int e = 0; e < 5; e++) reo += st.m(e);
         snprintf(b, sizeof b, "grade %.1f%%", tot > 1 ? 100 * reo / tot : 0.0);
         float gw = measure(F13, b).x;
-        snprintf(b, sizeof b, "next %s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
+        snprintf(b, sizeof b, "next %s", fmt_next(st.next_tick, UI.t).c_str());
         float nw = measure(F13, b).x;
         if (gw + nw + 12 < iw) {
             text(F13, ix, y + 2, "grade", COL_FAINT);
@@ -1082,7 +1140,8 @@ static void draw_timeline() {
         double days = t / MS_DAY;
         if (step >= 90 * MS_DAY) snprintf(b, sizeof b, "Y%d D%03d", (int)(days / 365) + 1, (int)days % 365 + 1);
         else snprintf(b, sizeof b, "D%03d", (int)days);
-        text(F13, x + 3, chart_y + chart_h - 14, b, COL_FAINT);
+        if (x > r.x + 2 && x < r.x + r.width - 60)
+            text(F13, x + 3, chart_y + chart_h - 14, b, COL_FAINT);
     }
 
     // ---- node stock envelopes, each normalized to its own max -----------------
@@ -1108,14 +1167,45 @@ static void draw_timeline() {
             if (mx < 0) continue;
             float yn = y0 + ch * (1 - (float)(mn / nmax) * 0.94f);
             float yx = y0 + ch * (1 - (float)(mx / nmax) * 0.94f);
-            DrawRectangle((float)px, yn, 1, std::max(1.0f, yx - yn + 1),
-                          strong ? Fade(nd.color, 0.95f) : Fade(nd.color, 0.55f));
+            float hgt = std::max(1.0f, yx - yn + 1);
+            // a hairline glued to the baseline reads as a stray axis rule — skip it
+            if (hgt <= 2.5f && yn > y0 + ch - 4) continue;
+            DrawRectangle((float)px, yn, 1, hgt, strong ? Fade(nd.color, 0.95f) : Fade(nd.color, 0.55f));
         }
         // selected: current value tag at the playhead
         if (strong) {
             double v = FR.st[n].mass_t();
             double u = clampd(v / nmax, 0, 1);
             DrawCircle(tl_t_to_x(UI.t), y0 + ch * (1 - (float)u * 0.94f), 3.5f, nd.color);
+        }
+    }
+
+    // ---- right-edge series labels at their current value ------------------------
+    {
+        struct Lbl { float y; Color c; const char* name; };
+        Lbl lbls[TRACE_MAX_NODES];
+        int nl = 0;
+        for (size_t n = 0; n < TR.nodes.size(); n++) {
+            Node& nd = TR.nodes[n];
+            double nmax = 0, nmin = 1e30;
+            for (int b = 0; b < NB; b++) {
+                nmax = std::max(nmax, (double)nd.series[b].mass.mx);
+                nmin = std::min(nmin, (double)nd.series[b].mass.mn);
+            }
+            if (nmax < 1 || (nmax - nmin) / nmax < 0.01) continue;
+            double v = FR.st[n].mass_t();
+            float yy = y0 + ch * (1 - (float)clampd(v / nmax, 0, 1) * 0.94f) - 6;
+            lbls[nl++] = { yy, nd.color, nd.info.name };
+        }
+        std::sort(lbls, lbls + nl, [](const Lbl& a, const Lbl& b) { return a.y < b.y; });
+        float next_free = -100;
+        for (int i = 0; i < nl; i++) {
+            if (lbls[i].y < next_free + 13) lbls[i].y = next_free + 13;   // nudge apart
+            next_free = lbls[i].y;
+            float tw = measure(F13, lbls[i].name).x + 8;
+            float lx = r.x + r.width - tw - 6;
+            DrawRectangle(lx - 2, lbls[i].y - 1, tw + 4, 13, Color{ 15, 19, 25, 210 });
+            text(F13, lx, lbls[i].y, lbls[i].name, lbls[i].c);
         }
     }
 
@@ -1128,7 +1218,7 @@ static void draw_timeline() {
         float y = lane_y + mk.kind * (lane_h + lane_gap);
         if (mk.t0 == mk.t1) DrawRectangle(x - 0.5f, y, 1.5f, lane_h, Fade(MARK_COL[mk.kind], 0.9f));
         else DrawRectangle(x, y, std::max(1.5f, x2 - x), lane_h + (mk.kind == N_DISRUPTED ? 2 : 0),
-                           Fade(MARK_COL[mk.kind], mk.kind == N_DISRUPTED ? 0.7f : 0.42f));
+                           Fade(MARK_COL[mk.kind], mk.kind == N_DISRUPTED ? 0.65f : 0.34f));
     }
 
     // ---- caption + legend ---------------------------------------------------------
@@ -1225,12 +1315,13 @@ static void draw_series_chart(Rectangle r, int n, double t0, double t1) {
     for (int ri = 0; ri < 4; ri++) {
         if (maxs[ri] < 0.01) continue;
         char b[48];
-        if (maxs[ri] >= 1000) snprintf(b, sizeof b, "%.1fk", maxs[ri] / 1000);
-        else snprintf(b, sizeof b, "%.0f", maxs[ri]);
-        char b2[64]; snprintf(b2, sizeof b2, "%s %s", refs[ri].name, b);
-        DrawRectangle(lx, r.y - 12, 10, 2.5f, refs[ri].c);
-        text(F13, lx + 15, r.y - 20, b2, COL_FAINT);
-        lx += 15 + measure(F13, b2).x + 12;
+        if (maxs[ri] >= 10000)      snprintf(b, sizeof b, "%.0fk", maxs[ri] / 1000);
+        else if (maxs[ri] >= 1000) snprintf(b, sizeof b, "%.1fk", maxs[ri] / 1000);
+        else                        snprintf(b, sizeof b, "%.0f", maxs[ri]);
+        char b2[64]; snprintf(b2, sizeof b2, "%s max %s", refs[ri].name, b);
+        DrawRectangle(lx, r.y - 13, 10, 2.5f, refs[ri].c);
+        text(F13, lx + 15, r.y - 21, b2, COL_FAINT);
+        lx += 15 + measure(F13, b2).x + 14;
     }
 
     DrawRectangleRec(r, COL_PANEL2);
@@ -1265,9 +1356,22 @@ static void draw_state_strip(Rectangle r, int n) {
     bool has[3] = {};
     for (auto& sc : nd.state_changes) has[sc.field] = true;
     int rows = has[0] + has[1] + has[2];
-    if (rows == 0) { text(F13, r.x + 6, r.y + 4, "no state changes", COL_FAINT); return; }
+    if (rows == 0) {
+        // no state machine: show arrival events instead
+        if (nd.inflow.empty()) { text(F13, r.x + 6, r.y + 4, "no state changes", COL_FAINT); return; }
+        DrawRectangleRec(r, COL_PANEL2);
+        for (auto& ev : nd.inflow) {
+            float x = r.x + (float)((double)ev.t / TR.t_end) * r.width;
+            DrawRectangle(x - 0.5f, r.y + 6, 1.5f, r.height - 12, Fade(nd.color, 0.8f));
+        }
+        char b[96];
+        snprintf(b, sizeof b, "%zu arrivals", nd.inflow.size());
+        text(F13, r.x + 6, r.y + r.height / 2 - 7, b, COL_TEXT);
+        float px = r.x + (float)((double)UI.t / TR.t_end) * r.width;
+        DrawLine(px, r.y, px, r.y + r.height, Fade(COL_PLAYHEAD, 0.95f));
+        return;
+    }
 
-    uint8_t cur[3] = { FR.st[n].proc_state, FR.st[n].truck_state, FR.st[n].conv_state };
     const char* row_names[3] = { "proc", "truck", "conv" };
     int f_drawn = -1;
     for (int f = 0; f < 3; f++) {
@@ -1277,9 +1381,10 @@ static void draw_state_strip(Rectangle r, int n) {
         float h = r.height / rows - 3;
         i64 t_prev = TR.ticks[0];
         uint8_t v_prev = 0;
+        static const Color TRACK = { 36, 43, 54, 255 };
         auto seg_col = [&](uint8_t v) {
-            if (f == 1) return v >= 2 ? &COL_ACCENT : (v == 1 ? &COL_GOOD : &COL_DIM);
-            return v == 2 ? &COL_WARN : (v == 1 ? &COL_DIM : &COL_PANEL2);
+            if (f == 1) return v >= 2 ? &COL_ACCENT : (v == 1 ? &COL_GOOD : &TRACK);
+            return v == 2 ? &COL_WARN : (v == 1 ? &TRACK : &COL_PANEL2);
         };
         for (auto& sc : nd.state_changes) {
             if (sc.field != f) continue;
@@ -1290,11 +1395,8 @@ static void draw_state_strip(Rectangle r, int n) {
         }
         float x0 = r.x + (float)((double)t_prev / TR.t_end) * r.width;
         DrawRectangle(x0, y, r.x + r.width - x0, h, Fade(*seg_col(v_prev), 0.8f));
-        const char* lbl = f == 0 ? proc_name(cur[0]) : (f == 1 ? truck_name(cur[1]) : conv_name(cur[2]));
-        text(F13, r.x + 4, y + 1, row_names[f], COL_FAINT);
-        float lw = measure(F13, row_names[f]).x + 8;
-        text(F13, r.x + 4 + lw, y + 1, lbl, COL_TEXT);
     }
+    (void)row_names;
     float px = r.x + (float)((double)UI.t / TR.t_end) * r.width;
     DrawLine(px, r.y, px, r.y + r.height, Fade(COL_PLAYHEAD, 0.95f));
 }
@@ -1373,7 +1475,7 @@ static void draw_inspector() {
         cx2 += chip(cx2, y, truck_name(st.truck_state), st.truck_state >= 2 ? COL_ACCENT : COL_GOOD) + 8;
     if (nd.info.type == T_CHEM_DISRUPTION && st.disrupted_until > UI.t)
         cx2 += chip(cx2, y, "DISRUPTED", COL_BAD) + 8;
-    snprintf(b, sizeof b, "next event in %s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
+    snprintf(b, sizeof b, "next event in %s", fmt_next(st.next_tick, UI.t).c_str());
     text_r(F13, x + iw, y + 1, b, COL_ACCENT);
     y += 30;
 
@@ -1391,8 +1493,7 @@ static void draw_inspector() {
     if (nd.info.belt_cells > 0) vline("belt (t)", st.belt_t());
     if (nd.info.type == T_CHEM_SRC) vline("acid tank (t)", st.chem());
     vline("total (t)", st.level());
-    double reo = 0; for (int e = 0; e < 5; e++) reo += st.m(e);
-    vline("stock REO (t)", reo);
+    vline("arrived to date (t)", cum_in_at(nd, UI.t));
     y += 10;
 
     // element split
@@ -1402,25 +1503,25 @@ static void draw_inspector() {
         double mt = st.mass_t();
         for (int e = 0; e < 6; e++) {
             text(F13, x, y, ELEM_NAMES[e], COL_ELEMS[e]);
-            snprintf(b, sizeof b, "%12.1f t", st.m(e));
+            snprintf(b, sizeof b, "%s", fmt_tons2(st.m(e)).c_str());
             text_r(F13, x + iw * 0.6f, y, b, COL_TEXT);
-            snprintf(b, sizeof b, "%5.1f%%", mt > 0 ? 100 * st.m(e) / mt : 0);
+            double pct = mt > 0 ? 100 * st.m(e) / mt : 0;
+            snprintf(b, sizeof b, pct < 0.1 && pct > 0 ? "%.2f%%" : "%.1f%%", pct);
             text_r(F13, x + iw, y, b, COL_DIM);
             y += 16;
         }
         y += 8;
     }
 
-    // history
-    text(FB16, x, y, "HISTORY · WHOLE RUN", COL_TEXT); y += 26;
-    draw_series_chart({ x, y, iw, 88 }, UI.sel, 0, TR.t_end); y += 112;
+    // history (the timeline itself is the zoomable view — this is the overview)
+    text(FB16, x, y, "HISTORY · WHOLE RUN", COL_TEXT); y += 24;    // heading row
+    y += 18;                                                        // legend row (drawn by chart)
+    draw_series_chart({ x, y, iw, 78 }, UI.sel, 0, TR.t_end); y += 78 + 20;
 
-    double zspan = std::max(30.0 * MS_DAY, UI.vw1 - UI.vw0);
-    text(FB16, x, y, "HISTORY · AROUND PLAYHEAD", COL_TEXT); y += 26;
-    draw_series_chart({ x, y, iw, 88 }, UI.sel, UI.t - zspan / 2, UI.t + zspan / 2); y += 112;
-
-    text(FB16, x, y, "STATE OVER TIME", COL_TEXT); y += 19;
-    draw_state_strip({ x, y, iw, 40 }, UI.sel); y += 52;
+    text(FB16, x, y, "STATE OVER TIME", COL_TEXT);
+    text(F13, x + 150, y + 2, "rows: proc · truck · conv", COL_FAINT);
+    y += 19;
+    draw_state_strip({ x, y, iw, 34 }, UI.sel); y += 46;
 
     if (button({ x, y, 140, 26 }, "< prev change", F13)) {
         i64 best = -1;
@@ -1466,7 +1567,7 @@ static void draw_table() {
         { "wip t",   86, true  },
         { "product t", 104, true },
         { "next event", 96, true },
-        { "24h \u0394 t", 84, true },
+        { "t / 24h", 84, true },
     };
     const int NC = 9;
     float colx[NC];
@@ -1521,18 +1622,29 @@ static void draw_table() {
         text_r(F13, colx[3] + cols[3].w - 6, y, b, COL_TEXT);
         double tot = st.mass_t() + st.belt_t(), reo = 0;
         for (int e = 0; e < 5; e++) reo += st.m(e);
-        snprintf(b, sizeof b, "%.1f", tot > 1 ? 100 * reo / tot : 0.0);
+        if (tot > 1) snprintf(b, sizeof b, "%.1f", 100 * reo / tot);
+        else snprintf(b, sizeof b, "-");
         text_r(F13, colx[4] + cols[4].w - 6, y, b, COL_DIM);
         snprintf(b, sizeof b, "%s", fmt_tons2(st.wip_t(), "").c_str());
         text_r(F13, colx[5] + cols[5].w - 6, y, b, st.wip_t() > 0 ? COL_WARN : COL_FAINT);
         snprintf(b, sizeof b, "%s", fmt_tons2(st.out_t() + st.chem(), "").c_str());
         text_r(F13, colx[6] + cols[6].w - 6, y, b, st.out_t() > 0 ? COL_GOOD : COL_FAINT);
-        snprintf(b, sizeof b, "%s", fmt_dur(st.next_tick - (i64)UI.t).c_str());
+        snprintf(b, sizeof b, "%s", fmt_next(st.next_tick, UI.t).c_str());
         text_r(F13, colx[7] + cols[7].w - 6, y, b, st.next_tick > UI.t ? COL_ACCENT : COL_FAINT);
 
-        double d24 = st.level() - UI.s24[n].level();
-        snprintf(b, sizeof b, "%+.0f", d24);
-        text_r(F13, colx[8] + cols[8].w - 6, y, b, d24 > 0.5 ? COL_GOOD : (d24 < -0.5 ? COL_BAD : COL_FAINT));
+        // exact throughput: tons arrived in the trailing 24 h
+        double thr = 0;
+        {
+            Node& nd2 = TR.nodes[n];
+            auto it = std::upper_bound(nd2.inflow.begin(), nd2.inflow.end(), UI.t,
+                [](double tt, const InflowEvent& e) { return tt < (double)e.t; });
+            for (auto j = it; j-- > nd2.inflow.begin();) {
+                if (j->t <= UI.t - MS_DAY) break;
+                thr += j->tons;
+            }
+        }
+        snprintf(b, sizeof b, "%.0f", thr);
+        text_r(F13, colx[8] + cols[8].w - 6, y, b, thr > 1 ? COL_TEXT : COL_FAINT);
         y += rh;
     }
     EndScissorMode();
@@ -1608,7 +1720,7 @@ static void draw_topbar() {
     };
     for (size_t n = 0; n < TR.nodes.size(); n++) {
         uint32_t ty = TR.nodes[n].info.type;
-        if (ty == T_MINER)     kpi("mined", TR.nodes[n].cum_in, TR.nodes[n].color);
+        if (ty == T_MINER)     kpi("mined", cum_in_at(TR.nodes[n], UI.t), TR.nodes[n].color);
         if (ty == T_FLOTATION) kpi("concentrate", FR.st[n].out_t(), COL_GOOD);
         if (ty == T_TAILINGS)  kpi("tailings", FR.st[n].mass_t(), TR.nodes[n].color);
         if (ty == T_CHEM_SRC)  kpi("acid", FR.st[n].chem(), COL_ACCENT);
@@ -1673,6 +1785,39 @@ static void draw_graph() {
         float glow = (float)clampd(recent / 200.0, 0.0, 1.0);
         Color c = Fade(info_edge ? COL_ACCENT : out.color, 0.4f + 0.5f * glow);
         draw_edge((int)i, nd.info.output, c, info_edge ? 1.5f : 2.5f + 2 * glow, info_edge);
+    }
+
+    // supply-chain region computed from the actual node rects
+    {
+        int reg_ids[] = { T_CHEM_DISRUPTION, T_CHEM_SRC, T_CHEM_SCRUM, TRACE_NODE_ADDITIVE_STOCK };
+        float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+        int found = 0;
+        for (int t : reg_ids)
+            for (size_t i = 0; i < TR.nodes.size(); i++)
+                if (TR.nodes[i].info.type == (uint32_t)t) {
+                    Rectangle nr = node_rect((int)i);
+                    minx = std::min(minx, nr.x); miny = std::min(miny, nr.y);
+                    maxx = std::max(maxx, nr.x + nr.width); maxy = std::max(maxy, nr.y + nr.height);
+                    found++;
+                }
+        if (found) {
+            Rectangle reg = { minx - 18, miny - 26, maxx - minx + 36, maxy - miny + 44 };
+            DrawRectangleRounded(reg, 0.05f, 6, Fade(COL_ACCENT, 0.04f));
+            DrawRectangleRoundedLinesEx(reg, 0.05f, 6, 1.2f, Fade(COL_ACCENT, 0.25f));
+            text_trunc(F13, reg.x + 12, reg.y + 7, "imports & supply contracts", Fade(COL_ACCENT, 0.6f), reg.width - 24);
+        }
+    }
+    // market disruption hangs over the acid supplier
+    {
+        int market = -1, supplier = -1;
+        for (size_t i = 0; i < TR.nodes.size(); i++) {
+            if (TR.nodes[i].info.type == T_CHEM_DISRUPTION) market = (int)i;
+            if (TR.nodes[i].info.type == T_CHEM_SRC) supplier = (int)i;
+        }
+        if (market >= 0 && supplier >= 0) {
+            bool dis = FR.st[market].disrupted_until > UI.t;
+            draw_edge(market, supplier, dis ? Fade(COL_BAD, 0.85f) : Fade(COL_BAD, 0.45f), 2.2f, true);
+        }
     }
 
     if (mine >= 0 && crusher >= 0) draw_road(mine, crusher);

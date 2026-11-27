@@ -514,6 +514,8 @@ static void clear_transactions() {
     g_transaction_count = 0;
 }
 
+#include "sim_trace.h"
+
 // !! have to be careful !!
 // IF ANY PART OF A TRANSACTION FAILS, THE WHOLE THING FAILS
 //
@@ -556,6 +558,8 @@ static b32 enact_transaction(T_ID id) {
         double moved_waste = src->waste * from_frac;
         dst->waste += moved_waste;
         src->waste -= moved_waste;
+
+        trace_note_move(dst_node, t->src, want_amt);
 
     } else if(t->mass_dst || t->mass_src || t->dst || t->amt) {
         debug_assert(false, "Uninitialized enact Move");
@@ -743,10 +747,20 @@ void tick(T_ID id) {
             if (grade_state < GRADE_MIN) grade_state = GRADE_MIN;
             if (grade_state > GRADE_MAX) grade_state = GRADE_MAX;
 
+            // Production is material entering the node from the (virtual)
+            // deposit: exact mined tonnage lands in the trace flow counters.
+            trace_note_move(n, NULL, tons);
+
             // Get REO from grade_state and load it into mass.
+            // NOTE: `reo` must sum only the ADDED tonnage — the assignment
+            // expression `elem[el] += add` evaluates to the updated (old+new)
+            // value, so accumulating that would double-count the pad's
+            // existing REO and subtract it from the waste below (mass leak).
             double reo = 0;
             for (int el = 0; el < N_ELEMS; el++) {
-                reo += n->mass.elem[el] += tons * grade_state * BASKET[el];
+                double add = tons * grade_state * BASKET[el];
+                n->mass.elem[el] += add;
+                reo += add;
             }
             n->mass.waste += tons - reo;
 
@@ -994,7 +1008,6 @@ b32 transfer(T_ID id) {
     return true;
 }
 
-#include "sim_trace.h"
 
 // g_w.END if there are no ticks in the future.
 i64 get_closest_node_tick() {
@@ -1091,6 +1104,7 @@ int main(int argc, char** argv) {
 
         // State after everything settled — this is what the viewer sees.
         trace_tick(ticked_mask);
+
 
 
         if (g_w.time >= next_report) {

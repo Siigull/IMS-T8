@@ -31,12 +31,18 @@
 static gzFile trace_file = NULL;
 static char   trace_path[512] = {0};
 
+// cumulative flow counters (tons moved by transactions since the start).
+// Monotonic, so the delta encoding logs exactly the ticks where flow happened.
+static double trace_flow_in [TRACE_MAX_NODES];
+static double trace_flow_out[TRACE_MAX_NODES];
+
 // Last-logged state, used for delta detection. f32-quantized masses.
 typedef struct T_Trace_Cache {
     float   mass[TRACE_MASS_SLOTS];
     int64_t next_tick, chem_last_scrum, disrupted_until;
     int32_t chem_cars, belt_head;
     float   chem_burned, chem_burned_at_scrum;
+    float   flow_in, flow_out;
     uint8_t proc_state, truck_state, conv_state;
     b32     ever_logged;
 } T_Trace_Cache;
@@ -52,6 +58,15 @@ static i64           trace_ticks_logged = 0;
 static void trace_put(const void* p, i64 n) {
     memcpy(trace_buf + trace_buf_len, p, n);
     trace_buf_len += n;
+}
+
+// Called by enact_transaction on every successful T_MOVE: records how many
+// tons actually moved, so the viewer gets exact edge throughput (stock-level
+// differencing can't separate an arrival from a departure in the same tick).
+static void trace_note_move(T_Node* dst_node, T_Node* src_node, double amt) {
+    if (trace_file == NULL) return;
+    if (dst_node && dst_node->id >= 0 && dst_node->id < TRACE_MAX_NODES) trace_flow_in[dst_node->id] += amt;
+    if (src_node && src_node->id >= 0 && src_node->id < TRACE_MAX_NODES) trace_flow_out[src_node->id] += amt;
 }
 
 // Give a node a human-readable name for the viewer (default = type name).
@@ -130,6 +145,8 @@ static b32 trace_open(const char* path) {
     }
 
     memset(trace_cache, 0, sizeof(trace_cache));
+    memset(trace_flow_in, 0, sizeof(trace_flow_in));
+    memset(trace_flow_out, 0, sizeof(trace_flow_out));
     return true;
 }
 
@@ -191,6 +208,8 @@ static void trace_tick(u64 ticked_mask) {
             cur.chem_burned_at_scrum = (float)n->chem_burned_at_scrum;
             cur.chem_last_scrum     = n->chem_last_scrum;
             cur.belt_head    = (int32_t)n->belt_head;
+            cur.flow_in      = (float)trace_flow_in[i];
+            cur.flow_out     = (float)trace_flow_out[i];
             if (n->type == N_CHEM_DISRUPTION)
                 cur.disrupted_until = g_w.chem_disrupted_until;
         }
@@ -212,6 +231,8 @@ static void trace_tick(u64 ticked_mask) {
         if (force || old->chem_last_scrum     != cur.chem_last_scrum)      sc_mask |= 1u<<TR_SC_CHEM_LAST_SCRUM;
         if (force || old->disrupted_until     != cur.disrupted_until)      sc_mask |= 1u<<TR_SC_DISRUPTED_UNTIL;
         if (force || old->belt_head    != cur.belt_head)    sc_mask |= 1u<<TR_SC_BELT_HEAD;
+        if (force || old->flow_in       != cur.flow_in)      sc_mask |= 1u<<TR_SC_FLOW_IN;
+        if (force || old->flow_out      != cur.flow_out)     sc_mask |= 1u<<TR_SC_FLOW_OUT;
 
         for (int s = 0; s < TRACE_MASS_SLOTS; s++)
             if (force || old->mass[s] != cur.mass[s]) ms_mask |= 1ull << s;
@@ -234,6 +255,8 @@ static void trace_tick(u64 ticked_mask) {
         if (sc_mask & (1u<<TR_SC_CHEM_LAST_SCRUM)) { int64_t v = cur.chem_last_scrum; trace_put(&v,8); }
         if (sc_mask & (1u<<TR_SC_DISRUPTED_UNTIL)) { int64_t v = cur.disrupted_until;  trace_put(&v,8); }
         if (sc_mask & (1u<<TR_SC_BELT_HEAD))   { int32_t v = cur.belt_head;    trace_put(&v,4); }
+        if (sc_mask & (1u<<TR_SC_FLOW_IN))     { float   v = cur.flow_in;      trace_put(&v,4); }
+        if (sc_mask & (1u<<TR_SC_FLOW_OUT))    { float   v = cur.flow_out;     trace_put(&v,4); }
 
         // masses, in bit order
         for (int s = 0; s < TRACE_MASS_SLOTS; s++)
