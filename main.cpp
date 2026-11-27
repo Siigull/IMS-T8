@@ -166,6 +166,8 @@ void debug_assert(bool cond, const char* why) {
     }
 }
 
+
+
 // Standard normal CDF: Phi(x) = 0.5 * (1 + erf(x / sqrt(2))).
 static double normal_cdf(double x) {
     return 0.5 * (1.0 + std::erf(x * 0.70710678118654752));
@@ -225,22 +227,26 @@ class C_World {
         }
 };
 
-C_World g_w;
+
 
 // One aggregate material mass — "the blob". elem[e] is the contained REO
 // tonnage of element e; waste is the rest. Ore tons = Σ elem + waste; head
 // grade is derivable: Σ elem / ore tons. No batch identity: a blob is a
 // blend of everything that entered it, like a real stockpile.
-typedef struct T_Mass {
-    double elem[N_ELEMS] = {};
-    double waste = 0;
-} T_Mass;
+class T_Mass {
+    public:
+        double elem[N_ELEMS] = {};
+        double waste = 0;
 
-static double mass_tons(const T_Mass* m) {
-    double t = m->waste;
-    for (int el = 0; el < N_ELEMS; el++) t += m->elem[el];
-    return t;
-}
+        double tons() {
+            double t = this->waste;
+            for (int el = 0; el < N_ELEMS; el++) t += this->elem[el];
+
+            return t;
+        }
+};
+
+
 
 enum E_Node_Type : u64 {
     N_MINER,
@@ -310,6 +316,8 @@ typedef struct T_Node {
 
 } T_Node;
 
+
+
 enum E_Transaction_Type : u64 {
     T_MOVE = 1 << 0,
     T_HEAD_INCREMENT = 1 << 1, // Increment head on conveyor
@@ -345,9 +353,25 @@ typedef struct T_Transaction {
 
 } T_Transaction;
 
+
+C_World g_w;
+
+constexpr int MAX_NODE_COUNT = 100;
+T_Node g_nodes[MAX_NODE_COUNT];
+int g_node_count = 0;
+
+// Memory helpers
+T_ID g_transfer_nodes[MAX_NODE_COUNT];
+int g_transfer_node_count = 0;
+
 constexpr int MAX_TRANSACTIONS = 100;
 T_Transaction g_transactions[MAX_TRANSACTIONS];
 i64 g_transaction_count = 0;
+
+// Imported additive stock — its own blob, outside the ore chain (see params).
+T_Mass g_additives;
+
+
 
 T_Transaction* make_transaction(u64 type) {
     assert(g_transaction_count < MAX_TRANSACTIONS, "Increase transaction capacity.");
@@ -360,6 +384,21 @@ T_Transaction* make_transaction(u64 type) {
     
     t->type = type;
     t->not_done = true;
+
+    return t;
+}
+
+T_Transaction* get_transaction(T_ID id) {
+    assert(id < g_transaction_count, "Transaction id out of bounds.");
+    
+    T_Transaction* t = &g_transactions[id];
+
+    assert(!(t->type & T_HEAD_INCREMENT) || !(t->type & T_MOVE), 
+            "Can't have move and head increment in single transaction.");
+    
+    if (!t->not_done) {
+        return NULL;
+    }
 
     return t;
 }
@@ -421,22 +460,17 @@ static void clear_transactions() {
 //
 // return true only at the end
 static b32 enact_transaction(T_ID id) {
-    assert(id < g_transaction_count, "Transaction id out of bounds.");
-    T_Transaction* t = &g_transactions[id];
-    assert(!(t->type & T_HEAD_INCREMENT) || !(t->type & T_MOVE), 
-            "Can't have move and head increment in single transaction.");
-    
-    if(!t->not_done) return false; // If already successfully processed before.
+    T_Transaction* t = get_transaction(id);
 
-    // Move some materials from one processor to another.
+    // MOVE BLOB OF MATERIALS BETWEEN NODES.
     if(t->type & T_MOVE) {
         T_Mass* dst = t->mass_dst;
         T_Mass* src = t->mass_src;
         T_Node* dst_node = t->dst;
         double want_amt = t->amt;
 
-        double from_total = mass_tons(src);
-        double to_total = mass_tons(dst);
+        double from_total = src->tons();
+        double to_total = dst->tons();
         double to_space_left = dst_node->mass_capacity - to_total;
 
         // Don't do transaction at all
@@ -464,14 +498,13 @@ static b32 enact_transaction(T_ID id) {
         debug_assert(false, "Uninitialized enact Move");
     }
 
-    // Change variable value. 
-    // (Might be outdated, now only for conveyor->head++)
+    // INCREMENT CONVEYOR HEAD. 
     if(t->type & T_HEAD_INCREMENT) {
         T_Node* c = t->conveyor;
         i64 head = c->belt_head % c->belt_size;
-        if (mass_tons(&c->belt[head]) <= 0.0) {
-            c->belt_head++;
 
+        if (c->belt[head].tons() <= 0.0) {
+            c->belt_head++;
         } else {
             return false;
         }
@@ -480,7 +513,7 @@ static b32 enact_transaction(T_ID id) {
         debug_assert(false, "Uninitialized enact Head");
     }
 
-    // Change truck state.
+    // CHANGE (TRUCK | CONV) = TRANSFERs STATE
     if(t->type & T_STATE) {
         assert(t->truck_state == NULL || t->conv_state == NULL, 
             "Can't change state on truck and conv in the same transaction.");
@@ -495,12 +528,12 @@ static b32 enact_transaction(T_ID id) {
             assert(false, "State change improperly init.");
         }
 
-
     } else if(t->truck_state || t->new_truck_state) {
         debug_assert(false, "Uninitialized enact State");
     }
 
-    // Set next tick to a timestamp.
+    // SET TICK
+    // NOTE(Sigull): Can rewrite previous tick. Not deterministic.
     if(t->type & T_TICK) {
         *t->tick_var = t->timestamp;
 
@@ -509,10 +542,14 @@ static b32 enact_transaction(T_ID id) {
     }
 
 
+    // WAKE UP SRC AND DST OF MOVE IF THEY ARE ASLEEP.
     // Kind of a hack. Wake up floation tank when move and tank is idle.
     // Reference comment in N_FLOATION in tick().
     if (t->type & T_MOVE) {
         T_Node* dst = t->dst;
+        T_Node* src = t->src;
+        
+        // DST
         // proc_state only on nodes, which can be woken up.
         bool proc_state_idle = dst->proc_state == S_IDLE;
         bool is_tick_in_past = dst->next_tick < g_w.time;
@@ -522,10 +559,7 @@ static b32 enact_transaction(T_ID id) {
             dst->next_tick = g_w.time + 5 * MIN;
         }
 
-        // TODO(Sigull): Maybe don't care about the states at all and just 
-        // wake things when the next tick is in past. Thought there might be 
-        // issues with this, but it looks more correct to me.
-        T_Node* src = t->src;
+        // SRC
         is_tick_in_past = src->next_tick < g_w.time;
         not_transfer = src->type != N_TRUCK && src->type != N_CONVEYOR;
 
@@ -538,17 +572,6 @@ static b32 enact_transaction(T_ID id) {
     return true;
 }
 
-constexpr int MAX_NODE_COUNT = 100;
-T_Node g_nodes[MAX_NODE_COUNT];
-int g_node_count = 0;
-
-// Memory helpers
-T_ID g_transfer_nodes[MAX_NODE_COUNT];
-int g_transfer_node_count = 0;
-
-
-// Imported additive stock — its own blob, outside the ore chain (see params).
-T_Mass g_additives;
 
 T_Node* init_node(E_Node_Type type) {
     assert(g_node_count < MAX_NODE_COUNT, "Too many nodes. Increase MAX_NODE_COUNT.");
@@ -564,6 +587,10 @@ T_Node* init_node(E_Node_Type type) {
         g_transfer_nodes[g_transfer_node_count++] = n->id;
     }
 
+    if (type == N_CONVEYOR) {
+        n->mass_capacity = BELT_CELL_CAP;
+    }
+
     // Nodes with state, which can be woken up by getting a transfer.
     if (type == N_CRUSHER || type == N_FLOTATION) {
         n->proc_state = S_IDLE;
@@ -573,6 +600,9 @@ T_Node* init_node(E_Node_Type type) {
 }
 
 static void inner_node_mass_move(T_Node* n, T_Mass* src, T_Mass* dst) {
+    assert(((size_t)src - (size_t)n) < sizeof(T_Node), "Supposedly inner src mass not inside of node.");
+    assert(((size_t)dst - (size_t)n) < sizeof(T_Node), "Supposedly inner dst mass not inside of node.");
+    
     for (int el = 0; el < N_ELEMS; el++) {
         dst->elem[el] += src->elem[el];
         src->elem[el] = 0;
@@ -586,13 +616,6 @@ T_Node* get_node(i64 id) {
     assert(id < g_node_count && id >= 0, "Code problem. Send ID out of range.");
 
     return &g_nodes[id];
-}
-
-T_Node* init_transfer_node(i64 length) {
-    T_Node* n = init_node(N_TRANSFER);
-    n->transfer_length = length;
-
-    return n;
 }
 
 void link_nodes(T_ID from, T_ID to) {
@@ -610,17 +633,19 @@ void tick(T_ID id) {
      switch(n->type) {
         case N_MINER:
         {
+            // Total amount of raw ore received
+            double tons = g_w.uniform(TONS_IN_BASKET_MIN, TONS_IN_BASKET_MAX);
+            
             // Grade of received ore. Changes over time.
             static double grade_state = GRADE_MEAN;
             grade_state = GRADE_MEAN
                         + GRADE_PHI * (grade_state - GRADE_MEAN)
                         + g_w.normal_distribution(0.0, GRADE_INNOV_SD);
+
             if (grade_state < GRADE_MIN) grade_state = GRADE_MIN;
             if (grade_state > GRADE_MAX) grade_state = GRADE_MAX;
 
-            // Total amount of raw ore received
-            double tons = g_w.uniform(TONS_IN_BASKET_MIN, TONS_IN_BASKET_MAX);
-
+            // Get REO from grade_state and load it into mass.
             double reo = 0;
             for (int el = 0; el < N_ELEMS; el++) {
                 reo += n->mass.elem[el] += tons * grade_state * BASKET[el];
@@ -629,9 +654,10 @@ void tick(T_ID id) {
 
             // Mine throttles against its own stockpile: pad near target runs at
             // nominal pace, a full pad slows the mine, a dry pad speeds it up.
-            double stock = mass_tons(&n->mass);
+            double stock = n->mass.tons();
             double speed = std::clamp(STOCK_TARGET / stock, MINE_SPEED_MIN, MINE_SPEED_MAX);
 
+            // TODO(Sigull): Maybe add slower modulation, but like this is overcooking.
             n->next_tick = g_w.time + g_w.exponential(ARRIVAL_MEAN / speed);
         } break;
 
@@ -660,7 +686,7 @@ void tick(T_ID id) {
         case N_CRUSHER:
         {
             if (n->proc_state == S_FINISH) {
-                if (mass_tons(&n->out) + mass_tons(&n->wip) < n->mass_capacity) {
+                if (n->out.tons() + n->wip.tons() < n->mass_capacity) {
                     inner_node_mass_move(n, &n->wip, &n->out);
 
                     n->proc_state = S_IDLE;
@@ -668,7 +694,7 @@ void tick(T_ID id) {
                 }
 
             } else if (n->proc_state == S_IDLE) {
-                double tons = mass_tons(&n->mass);
+                double tons = n->mass.tons();
                 if (tons > 0.0) {
                     double rate = g_w.uniform(CRUSHER_MIN_RATE, CRUSHER_MAX_RATE);
                     inner_node_mass_move(n, &n->mass, &n->wip);
@@ -722,7 +748,7 @@ void tick(T_ID id) {
             
             // CASE S_IDLE
             } else if(n->proc_state == S_IDLE) {
-                double tons = mass_tons(&n->mass);
+                double tons = n->mass.tons();
                 
                 // NOTE(Sigull):
                 //   If it can't start now. It will be woken up with tick from
@@ -772,7 +798,7 @@ b32 transfer(T_ID id) {
         {
             if (n->truck_state == TRUCK_HAUL) {
                 T_Transaction* t = make_transaction(T_MOVE | T_STATE | T_TICK);
-                trans_add_move(t, &n->mass, n, &dst->mass, dst, mass_tons(&n->mass));
+                trans_add_move(t, &n->mass, n, &dst->mass, dst, n->mass.tons());
                 trans_add_truck_state(t, &n->truck_state, TRUCK_TRAVEL_TO_MINE);
                 
                 trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
@@ -783,7 +809,6 @@ b32 transfer(T_ID id) {
                 trans_add_truck_state(t, &n->truck_state, TRUCK_TRAVEL_TO_EXTRACTION);
 
                 trans_add_tick(t, &n->next_tick, g_w.time + TRUCK_DRIVE_TIME);
-
             }
         } break;
 
@@ -795,7 +820,7 @@ b32 transfer(T_ID id) {
                 i64 read_head  = n->belt_head % n->belt_size;
                 T_Transaction* t1;
                 t1 = make_transaction(T_MOVE);
-                trans_add_move(t1, &n->belt[read_head], n, &dst->mass, dst, mass_tons(&n->belt[read_head]));
+                trans_add_move(t1, &n->belt[read_head], n, &dst->mass, dst, n->belt[read_head].tons());
     
                 // Receiving
                 i64 write_head = (n->belt_head - 1) % n->belt_size;
@@ -820,6 +845,21 @@ b32 transfer(T_ID id) {
     return true;
 }
 
+// g_w.END if there are no ticks in the future.
+i64 get_closest_node_tick() {
+    i64 best = g_w.END;
+
+    for (int i = 0; i < g_node_count; i++) {
+        i64 tick_i = g_nodes[i].next_tick;
+
+        if (tick_i < best && tick_i >= g_w.time) {
+            best = g_nodes[i].next_tick;
+        }
+    }
+
+    return best;
+}
+
 int main(void) {
     // miner -> truck ─> crusher -> belt ─> flotation -> rejects ─> dam
     T_Node* miner   = init_node(N_MINER);
@@ -830,12 +870,6 @@ int main(void) {
     T_Node* dam     = init_node(N_TAILINGS);
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
-
-    // Belt cells cap per cell: every move into a belt cell is clamped to
-    // that cell's remaining space at enactment time, so a cell can never
-    // exceed BELT_CELL_CAP — including when a cell is blocked downstream
-    // and keeps its old load.
-    belt->mass_capacity = BELT_CELL_CAP;
 
     link_nodes(miner->id,   truck->id);
     link_nodes(truck->id,   crusher->id);
@@ -854,23 +888,19 @@ int main(void) {
         // Transactions are only mid tick.
         clear_transactions();
 
-        // 1) advance to the earliest due event
-        i64 best = g_w.END;
-        for (int i = 0; i < g_node_count; i++) {
-            i64 tick_i = g_nodes[i].next_tick;
 
-            if (tick_i < best && tick_i >= g_w.time) {
-                best = g_nodes[i].next_tick;
+        i64 next_tick = get_closest_node_tick();
+        if (next_tick == g_w.END) {
+            if (g_w.END - g_w.time >= 1 * DAY) {
+                std::cout << "[engine] stalled: no events scheduled at t = "
+                          << g_w.time / DAY << " d\n";
             }
-        }
-        if (best == g_w.END) {
-            std::cout << "[engine] stalled: no events scheduled at t = "
-                      << g_w.time / DAY << " d\n";
+
             break;
         }
+        g_w.time = next_tick;
 
-        // Ticks at exactly this time.
-        g_w.time = best;
+
         for (int i=0; i<g_node_count; i++) {
             tick(i);
         }
@@ -889,16 +919,16 @@ int main(void) {
                 changed |= enact_transaction(i); // If all remaining transactions don't do shit, break.
         }
 
-        // 3) periodic report
+
         if (g_w.time >= next_report) {
             next_report += 30 * DAY;
             std::cout << "day " << g_w.time / DAY
-                      << "  pad "    << mass_tons(&miner->mass)
-                      << "  crush "  << mass_tons(&crusher->mass) << "/" << mass_tons(&crusher->out)
-                      << "  belt "   << [belt]{ double s = 0; for (int i = 0; i < BELT_CELLS; i++) s += mass_tons(&belt->belt[i]); return s; }()
-                      << "  flot "   << mass_tons(&flot->mass) << "/" << mass_tons(&flot->out)
-                      << "  dam "    << mass_tons(&dam->mass)
-                      << "  add "    << mass_tons(&g_additives)
+                      << "  pad "    << miner->mass.tons()
+                      << "  crush "  << crusher->mass.tons() << "/" << crusher->out.tons()
+                      << "  belt "   << [belt]{ double s = 0; for (int i = 0; i < BELT_CELLS; i++) s += belt->belt[i].tons(); return s; }()
+                      << "  flot "   << flot->mass.tons() << "/" << flot->out.tons()
+                      << "  dam "    << dam->mass.tons()
+                      << "  add "    << g_additives.tons()
                       << "\n";
         }
     }
