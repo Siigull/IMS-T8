@@ -304,8 +304,7 @@ static bool load_trace(const char* path) {
             double lv = run[i].level();
             double jump = lv - prev_level[i];
             double tick_in = run[i].flow_in_tot - before.flow_in_tot;
-            double tick_out = run[i].flow_out_tot - before.flow_out_tot;
-            // transfers in > production in (sources) > net level jump (tank fills)
+            // transfers in > net level jump (tank fills that are not transactions)
             double arrived = tick_in > 0.01 ? tick_in : (jump > 1.0 ? jump : 0);
             if (arrived > 1.0) {
                 nd.inflow.push_back({ time, (float)arrived });
