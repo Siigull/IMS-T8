@@ -1018,6 +1018,11 @@ int main(void) {
     T_Node* belt    = init_node(N_CONVEYOR);
     T_Node* flot    = init_node(N_FLOTATION);
     T_Node* dam     = init_node(N_TAILINGS);
+
+    init_node(N_CHEM_DISRUPTION);
+    T_Node* chem     = init_node(N_CHEM_SRC);
+    T_Node* chem_sc  = init_node(N_CHEM_MONTHLY_SCRUM);
+
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
 
@@ -1026,6 +1031,7 @@ int main(void) {
     link_nodes(crusher->id, belt->id);
     link_nodes(belt->id,    flot->id);
     link_nodes(flot->id,    dam->id); // reject stream; product waits in flot->out
+    link_nodes(chem->id, chem_sc->id);
 
     i64 next_report = 30 * DAY;
     while (g_w.time < g_w.END) {
