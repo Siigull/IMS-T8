@@ -175,7 +175,7 @@ constexpr int    ADDITIVE_ELEM         = N_ELEMS - 1; // Dy
 // One delivery slot per week, ~3 cars per string at the design burn of
 // ~33 t/day (85 t cars [W]). Disruptions (the 2022–23 acid squeeze) are
 // what the tank farm and the scrum exist to absorb.
-constexpr double CHEM_LOT_TONS        = 85.0;      // t per rail car
+constexpr double CHEM_LOT_TONS         = 85.0;      // t per rail car
 constexpr double CHEM_TANK_CAP         = 400.0;     // t, tank farm (mass_capacity)
 constexpr double CHEM_TARGET           = 200.0;     // t, planning target (~6 d cover)
 constexpr double CHEM_CATCHUP_DAYS     = 10.0;      // refill slope: must beat the ~12 t/day
@@ -188,8 +188,29 @@ constexpr i64    CHEM_EVENT_MEAN       = 120 * DAY;  // mean gap between disrupt
 constexpr i64    CHEM_DISRUPT_MEDIAN   = 6 * DAY;    // median disruption length
 constexpr double CHEM_DISRUPT_SIGMA    = 0.6;       // lognormal sigma (right-skew)
 
+
+// ############## Digest. Combination chemicals and flotation. ##############
+constexpr double DIGEST_MIN_CAMPAIGN = 8; // [tons]. Min to start digest batch.
+constexpr double DIGEST_MAX_CAMPAIGN = 40; // [tons]
+
+constexpr double DIGEST_MAX_PLS = 30; // [tons]. Pregnant leach solution.
+
+constexpr double DIGEST_RATE_MIN = 1.0;
+constexpr double DIGEST_RATE_MID = 1.6;
+constexpr double DIGEST_RATE_MAX = 2.4;
+
+constexpr double DIGEST_A_MIN = 0.9;
+constexpr double DIGEST_A_MID = 1.2;
+constexpr double DIGEST_A_MAX = 1.5;
+
+constexpr double DIGEST_R_MIN = 0.9;
+constexpr double DIGEST_R_MID = 0.945;
+constexpr double DIGEST_R_MAX = 0.98;
+
+
 // Ground simulation params.
 constexpr i64 SEED  = 'm' + 'e' + 'o' + 'w';
+
 
 void assert(bool cond, const char* why) {
     if(!cond) {
@@ -204,7 +225,6 @@ void debug_assert(bool cond, const char* why) {
         exit(1);
     }
 }
-
 
 
 // Standard normal CDF: Phi(x) = 0.5 * (1 + erf(x / sqrt(2))).
@@ -280,6 +300,8 @@ class T_Mass {
         double elem[N_ELEMS] = {};
         double waste = 0;
 
+        double max_tons = HUGE_VAL;
+
         double tons() {
             double t = this->waste;
             for (int el = 0; el < N_ELEMS; el++) t += this->elem[el];
@@ -291,6 +313,8 @@ class T_Mass {
 class T_Chem_Mass {
     public:
         double chem = 0; // H_2SO_4
+
+        double max_tons = HUGE_VAL;
 
         double tons() {
             return chem;
@@ -306,7 +330,9 @@ enum E_Node_Type : u64 {
     N_TRUCK,
     N_CRUSHER,
     N_CONVEYOR,
+    N_PIPE,
     N_FLOTATION,
+    N_DIGEST,
     N_TAILINGS,     // passive sink: the dam (never scheduled)
 };
 
@@ -329,6 +355,7 @@ enum E_Truck_State : u64 {
     TRUCK_TRAVEL_TO_EXTRACTION,  
 };
 
+// TODO(Sigull): Need better node docs, like I did in IFJ project for AST.
 
 // TODO(Sigull): Thinking about having an ordered queue for ticks. Not just next tick.
 // That was my original idea, but AI did it differently and I kept it.
@@ -338,6 +365,7 @@ typedef struct T_Node {
 
     T_ID input = -1;
     T_ID output = -1;
+    T_ID waste_output = -1; // Used for example in in N_FLOTATION to connect dam.
 
     i64 next_tick = -1; // next scheduled event; -1 = idle
 
@@ -346,7 +374,7 @@ typedef struct T_Node {
     T_Mass wip;
     T_Mass out;
 
-    T_Chem_Mass chem_mass;
+    T_Chem_Mass chem_mass; // When gets used, it is just burned.
 
     // Cap of a destination stock on this node, checked against the dst
     // T_Mass' live content at enactment time. NOTE for N_CONVEYOR: moves
@@ -363,6 +391,9 @@ typedef struct T_Node {
     T_Mass belt[BELT_CELLS];
     i64 belt_size = BELT_CELLS;
     i64 belt_head = 1;
+    
+    // N_PIPE
+    T_Chem_Mass belt_chem[BELT_CELLS];
 
     // N_TRANSFER
     i64 transfer_length = 0;
@@ -378,6 +409,9 @@ typedef struct T_Node {
     double chem_burned_at_scrum = 0; // chem_burned snapshot at the last scrum
     i64    chem_last_scrum      = 0; // when the last scrum happened
 
+    // N_DIGEST
+    T_ID chem_input = -1; // digest has chem and ore input.
+
 } T_Node;
 
 
@@ -387,6 +421,7 @@ enum E_Transaction_Type : u64 {
     T_HEAD_INCREMENT = 1 << 1, // Increment head on conveyor
     T_STATE = 1 << 2,
     T_TICK = 1 << 3, // Probably something with event planning.
+    T_MOVE_CHEM = 1 << 4,
 };
 
 // ALL PASSED IN ONE TRANSACTION HAVE SUCCEED TO HAPPEN. ATOMIC.
@@ -400,6 +435,13 @@ typedef struct T_Transaction {
     T_Node* src;
     T_Node* dst;
     double amt;
+
+    // T_MOVE_CHEM
+    T_Chem_Mass* chem_mass_src;
+    T_Chem_Mass* chem_mass_dst;
+    T_Node* chem_src;
+    T_Node* chem_dst;
+    double chem_amt;
 
     // T_HEAD_INCREMENT
     T_Node* conveyor;
@@ -437,9 +479,14 @@ T_Mass g_additives;
 
 T_Transaction* make_transaction(u64 type) {
     assert(g_transaction_count < MAX_TRANSACTIONS, "Increase transaction capacity.");
-    // Check enact_transaction comment for reason.
+    // Check enact_transaction comment for reason for these asserts.
+    // They can be implemented, just not worth it for now.
     assert(!(type & T_HEAD_INCREMENT) || !(type & T_MOVE), 
             "Can't have move and head increment in single transaction.");
+    assert(!(type & T_HEAD_INCREMENT) || !(type & T_MOVE_CHEM), 
+            "Can't have move and head increment in single transaction.");
+    assert(!(type & T_MOVE_CHEM) || !(type & T_MOVE), 
+            "Can't move chem and materials in the same transaction.");
 
     T_Transaction* t = &g_transactions[g_transaction_count++];
     *t = T_Transaction();
@@ -476,14 +523,26 @@ void trans_add_move(T_Transaction* t, T_Mass* mass_src, T_Node* src, T_Mass* mas
     t->dst = dst;
 
     t->amt = amt;
+}
 
-    debug_assert(((size_t)mass_dst - (size_t)dst) < sizeof(T_Node), "Move 2");
+void trans_add_move_chem(T_Transaction* t, T_Chem_Mass* chem_src, T_Node* src, T_Chem_Mass* chem_dst, T_Node* dst, double amt) {
+    debug_assert(t->type & T_MOVE, "Move 1");
+    assert(((size_t)chem_src - (size_t)src) < sizeof(T_Node), "add_move: src mass not in src");
+    assert(((size_t)chem_dst - (size_t)dst) < sizeof(T_Node), "add_move: dst mass not in dst");
+
+    t->chem_mass_src = chem_src;
+    t->chem_mass_dst = chem_dst;
+    t->chem_src = src;
+    t->chem_dst = dst;
+
+    t->amt = amt;
 }
 
 void trans_add_head(T_Transaction* t, T_Node* conveyor) {
     debug_assert(t->type & T_HEAD_INCREMENT, "Var 1");
 
-    assert(conveyor->type == N_CONVEYOR, "trans_add_head passed param is not conveyor.");
+    assert(conveyor->type == N_CONVEYOR || 
+           conveyor->type == N_PIPE, "trans_add_head passed param is not conveyor.");
 
     t->conveyor = conveyor;
 }
@@ -513,8 +572,6 @@ void trans_add_tick(T_Transaction* t, i64* tick_var, i64 timestamp) {
 static void clear_transactions() {
     g_transaction_count = 0;
 }
-
-#include "sim_trace.h"
 
 // !! have to be careful !!
 // IF ANY PART OF A TRANSACTION FAILS, THE WHOLE THING FAILS
@@ -559,7 +616,31 @@ static b32 enact_transaction(T_ID id) {
         dst->waste += moved_waste;
         src->waste -= moved_waste;
 
-        trace_note_move(dst_node, t->src, want_amt);
+    } else if(t->mass_dst || t->mass_src || t->dst || t->amt) {
+        debug_assert(false, "Uninitialized enact Move");
+    }
+
+    if(t->type & T_MOVE_CHEM) {
+        T_Chem_Mass* dst = t->chem_mass_dst;
+        T_Chem_Mass* src = t->chem_mass_src;
+        T_Node* dst_node = t->chem_dst;
+        double want_amt = t->chem_amt;
+
+        double from_total = src->tons();
+        double to_total = dst->tons();
+        double to_space_left = dst_node->mass_capacity - to_total;
+
+        // Don't do transaction at all
+        if (to_space_left <= 0.0) return false;
+        if (from_total <= 0.0) return false;
+
+        if (want_amt > to_space_left) want_amt = to_space_left;
+        if (want_amt > from_total)    want_amt = from_total;
+
+        double from_frac = want_amt / from_total;
+        double moved = src->chem * from_frac;
+        dst->chem += moved;
+        src->chem -= moved;
 
     } else if(t->mass_dst || t->mass_src || t->dst || t->amt) {
         debug_assert(false, "Uninitialized enact Move");
@@ -643,24 +724,6 @@ static b32 enact_transaction(T_ID id) {
 T_Node* init_node(E_Node_Type type) {
     assert(g_node_count < MAX_NODE_COUNT, "Too many nodes. Increase MAX_NODE_COUNT.");
 
-    // // Handled check, just debug.
-    // // Add case when handled.
-    // switch(type) {
-    //     case N_MINER:
-    //     case N_CHEM_SRC:
-    //     case N_CHEM_DISRUPTION:
-    //     case N_CHEM_MONTHLY_SCRUM:
-    //     case N_ADDITIVE_SRC:
-    //     case N_TRUCK:
-    //     case N_CRUSHER:
-    //     case N_CONVEYOR:
-    //     case N_FLOTATION:
-    //     case N_TAILINGS:
-    //         break;
-    //     default:
-    //         assert(false, "Unhandled node type!");
-    // }
-
     T_Node* n = &g_nodes[g_node_count];
 
     n->id = g_node_count++;
@@ -676,21 +739,30 @@ T_Node* init_node(E_Node_Type type) {
     }
 
     // Transfer nodes
-    if (type == N_CONVEYOR || type == N_TRUCK) {
+    if (type == N_CONVEYOR || type == N_TRUCK || type == N_PIPE) {
         g_transfer_nodes[g_transfer_node_count++] = n->id;
     }
 
-    if (type == N_CONVEYOR) {
+    if (type == N_CONVEYOR || N_PIPE) {
         n->mass_capacity = BELT_CELL_CAP;
     }
 
     // Nodes with state, which can be woken up by getting a transfer.
-    if (type == N_CRUSHER || type == N_FLOTATION) {
+    if (type == N_CRUSHER || type == N_FLOTATION || type == N_DIGEST) {
         n->proc_state = S_IDLE;
     }
 
     if (type == N_CHEM_SRC) {
         n->mass_capacity = CHEM_TANK_CAP;
+        n->next_tick = 1 * DAY;
+    }
+
+    if (type == N_DIGEST) {
+        T_Node* chem_src = find_node(N_CHEM_SRC);
+        assert(chem_src != NULL, "Chem src has to be inited before this.");
+
+        n->chem_input = chem_src->id;
+        n->mass_capacity = DIGEST_MAX_PLS;
         n->next_tick = 1 * DAY;
     }
 
@@ -714,18 +786,71 @@ static void inner_node_mass_move(T_Node* n, T_Mass* src, T_Mass* dst) {
     src->waste = 0;
 }
 
+// Proportional slice of a stock: move `tons` from src into dst, blended by
+// src's composition (the same math enact_transaction applies to T_MOVE).
+static void mass_move_amount(T_Mass* src, T_Mass* dst, double tons) {
+    double total = src->tons();
+    if (tons > total) tons = total;
+    if (tons <= 0.0) return;
+
+    double frac = tons / total;
+    for (int el = 0; el < N_ELEMS; el++) {
+        double moved = src->elem[el] * frac;
+        dst->elem[el] += moved;
+        src->elem[el] -= moved;
+    }
+    double moved_waste = src->waste * frac;
+    dst->waste += moved_waste;
+    src->waste -= moved_waste;
+}
+
+// Contained REO — the PLS currency (everything the digest dissolves; the
+// gangue reporting to the residue is not part of it).
+static double reo_tons(const T_Mass* m) {
+    double t = 0;
+    for (int el = 0; el < N_ELEMS; el++) t += m->elem[el];
+    return t;
+}
+
 T_Node* get_node(i64 id) {
     assert(id < g_node_count && id >= 0, "Code problem. Send ID out of range.");
 
     return &g_nodes[id];
 }
 
-void link_nodes(T_ID from, T_ID to) {
-    T_Node* from_n = get_node(from);
-    T_Node* to_n   = get_node(to);
+T_Node* find_node(E_Node_Type type) {
+    for (int i = 0; i < g_node_count; i++) {
+        if (g_nodes[i].type == type) return &g_nodes[i];
+    }
 
-    from_n->output = to_n->id;
-    to_n->input    = from_n->id;
+    assert(false, "Node of this type not found.");
+    return NULL;
+}
+
+
+// TODO(Sigull): This should have a better abstraction, but don't know what yet.
+void link_nodes(T_Node* from, T_Node* to) {
+    assert(from->output == -1, "From output already linked.");
+    assert(to->input    == -1, "To input already linked.");
+
+    from->output = to->id;
+    to->input    = from->id;
+}
+
+void link_waste(T_Node* from, T_Node* to) {
+    assert(from->output == -1, "Waste from output already linked.");
+    assert(to->input    == -1, "Waste to input already linked.");
+
+    from->waste_output = to->id;
+    to->input          = from->id;
+}
+
+void link_chem(T_Node* from, T_Node* to) {
+    assert(from->output   == -1, "Chem from output already set.");
+    assert(to->chem_input == -1, "Chem to input already linked.");
+
+    from->output   = to->id;
+    to->chem_input = from->id;
 }
 
 void tick(T_ID id) {
@@ -747,15 +872,7 @@ void tick(T_ID id) {
             if (grade_state < GRADE_MIN) grade_state = GRADE_MIN;
             if (grade_state > GRADE_MAX) grade_state = GRADE_MAX;
 
-            // Production is material entering the node from the (virtual)
-            // deposit: exact mined tonnage lands in the trace flow counters.
-            trace_note_move(n, NULL, tons);
-
             // Get REO from grade_state and load it into mass.
-            // NOTE: `reo` must sum only the ADDED tonnage — the assignment
-            // expression `elem[el] += add` evaluates to the updated (old+new)
-            // value, so accumulating that would double-count the pad's
-            // existing REO and subtract it from the waste below (mass leak).
             double reo = 0;
             for (int el = 0; el < N_ELEMS; el++) {
                 double add = tons * grade_state * BASKET[el];
@@ -826,6 +943,47 @@ void tick(T_ID id) {
         } break;
 
 
+        case N_DIGEST:
+        {
+            if (n->proc_state == S_FINISH) {
+                if (n->out.tons() + reo_tons(&n->wip) <= n->mass_capacity) {
+                    double r = g_w.triangular(DIGEST_R_MIN, DIGEST_R_MID, DIGEST_R_MAX);
+
+                    T_Node* pond = get_node(n->waste_output);
+                    for (int el = 0; el < N_ELEMS; el++) {
+                        pond->mass.elem[el] += n->wip.elem[el] * (1.0 - r);
+                        n->wip.elem[el]     *= r;
+                    }
+
+                    pond->mass.waste += n->wip.waste;
+                    n->wip.waste = 0;
+
+                    inner_node_mass_move(n, &n->wip, &n->out);
+
+                    n->proc_state = S_IDLE;
+                    n->next_tick = g_w.time + 5 * MIN;
+                }
+
+            } else if (n->proc_state == S_IDLE) {
+                double feed = n->mass.tons();
+
+                double a = g_w.triangular(DIGEST_A_MIN, DIGEST_A_MID, DIGEST_A_MAX);
+                double tons = std::min(std::min(feed, DIGEST_MAX_CAMPAIGN), n->chem_mass.tons() / a);
+
+                // Proceed to batch and digest.
+                if (feed >= DIGEST_MIN_CAMPAIGN && tons >= DIGEST_MIN_CAMPAIGN) {
+                    inner_node_mass_move(n, &n->mass, &n->wip);
+                    n->chem_mass.chem -= a * tons;
+                    n->chem_burned    += a * tons;
+
+                    double rate = g_w.triangular(DIGEST_RATE_MIN, DIGEST_RATE_MID, DIGEST_RATE_MAX);
+                    n->proc_state = S_FINISH;
+                    n->next_tick = g_w.time + (i64)std::llround(tons / rate * HOUR);
+                }
+            }
+        } break;
+
+
         case N_ADDITIVE_SRC:
         {
             g_additives.elem[ADDITIVE_ELEM] += ADDITIVE_LOT_TONS;
@@ -866,7 +1024,8 @@ void tick(T_ID id) {
                     n->proc_state = S_FINISH;
                     n->next_tick = g_w.time + (i64)std::llround(tons / rate * HOUR);
                 }
-            }
+            } 
+
         } break;
 
 
@@ -882,6 +1041,8 @@ void tick(T_ID id) {
 
         // TODO(Sigull): This whole code can't really map to real life.
         //               Also I remember it should have a failure state.
+        
+        // TODO(Sigull): Has no capacity limit on output.
         case N_FLOTATION:
         {
             // CASE S_FINISH
@@ -890,7 +1051,7 @@ void tick(T_ID id) {
                                     FLOTATION_MID_RECOVERY,
                                     FLOTATION_MAX_RECOVERY);
 
-                T_Node* dam = get_node(n->output);
+                T_Node* dam = get_node(n->waste_output);
                 double rec = 0;
                 for (int el = 0; el < N_ELEMS; el++) {
                     dam->mass.elem[el] += n->wip.elem[el] * (1.0 - r);
@@ -999,6 +1160,31 @@ b32 transfer(T_ID id) {
             }
         } break;
 
+
+        case N_PIPE:
+        {
+            if (n->conv_state != C_MOVING){
+                // Sending
+                i64 read_head  = n->belt_head % n->belt_size;
+                T_Transaction* t1;
+                t1 = make_transaction(T_MOVE_CHEM);
+                trans_add_move_chem(t1, &n->belt_chem[read_head], n, &dst->chem_mass, dst, n->belt[read_head].tons());
+    
+                // Receiving
+                i64 write_head = (n->belt_head - 1) % n->belt_size;
+                T_Transaction* t2 = make_transaction(T_MOVE_CHEM);
+                trans_add_move_chem(t2, &src->chem_mass, src, &n->belt_chem[write_head], n, BELT_CELL_CAP);
+    
+                // Increment head
+                T_Transaction* t3 = make_transaction(T_HEAD_INCREMENT | T_STATE | T_TICK);
+                trans_add_head(t3, n); // Takes care of the fact, that it can only increment when at read head 0 tons.
+                trans_add_tick(t3, &n->next_tick, g_w.time + BELT_TICK);
+                trans_add_conveyor_state(t3, &n->conv_state, C_MOVING);
+                //#############################
+            }
+        } break;
+
+
         default:
         {
             assert(false, "Unhandled/Wrong node type.");
@@ -1008,6 +1194,7 @@ b32 transfer(T_ID id) {
     return true;
 }
 
+#include "sim_trace.h"
 
 // g_w.END if there are no ticks in the future.
 i64 get_closest_node_tick() {
@@ -1027,35 +1214,51 @@ i64 get_closest_node_tick() {
 int main(int argc, char** argv) {
     // miner -> truck ─> crusher -> belt ─> flotation -> rejects ─> dam
     T_Node* miner   = init_node(N_MINER);
+    init_node(N_CHEM_DISRUPTION); // Is kind of a global node.
+    T_Node* chem    = init_node(N_CHEM_SRC);
+    T_Node* chem_sc = init_node(N_CHEM_MONTHLY_SCRUM);
+
     T_Node* truck   = init_node(N_TRUCK);
     T_Node* crusher = init_node(N_CRUSHER);
     T_Node* belt    = init_node(N_CONVEYOR);
     T_Node* flot    = init_node(N_FLOTATION);
     T_Node* dam     = init_node(N_TAILINGS);
 
-    init_node(N_CHEM_DISRUPTION);
-    T_Node* chem     = init_node(N_CHEM_SRC);
-    T_Node* chem_sc  = init_node(N_CHEM_MONTHLY_SCRUM);
+    T_Node* pipe    = init_node(N_PIPE);
+    T_Node* belt1   = init_node(N_CONVEYOR); 
+    T_Node* digest  = init_node(N_DIGEST);
+    T_Node* pond    = init_node(N_TAILINGS);
 
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
+    
+    link_waste(flot, dam);
 
-    link_nodes(miner->id,   truck->id);
-    link_nodes(truck->id,   crusher->id);
-    link_nodes(crusher->id, belt->id);
-    link_nodes(belt->id,    flot->id);
-    link_nodes(flot->id,    dam->id); // reject stream; product waits in flot->out
-    link_nodes(chem->id, chem_sc->id);
+    link_nodes(flot, belt1);
+    link_nodes(belt1, digest);
+
+    link_chem(chem, pipe);
+    link_chem(pipe, digest);
+
+    link_waste(digest, pond);
+
+    link_nodes(miner,   truck);
+    link_nodes(truck,   crusher);
+    link_nodes(crusher, belt);
+    link_nodes(belt,    flot);
+    link_nodes(chem,    chem_sc);
 
     // Trace every tick for the viewer app ("-" disables, see sim_trace.h).
-    trace_set_name(miner->id,         "Mine");
-    trace_set_name(truck->id,          "Haul truck");
-    trace_set_name(crusher->id,        "Crusher");
-    trace_set_name(belt->id,           "Belt conveyor");
-    trace_set_name(flot->id,           "Flotation");
-    trace_set_name(dam->id,           "Tailings dam");
-    trace_set_name(chem->id,           "Acid supplier");
-    trace_set_name(chem_sc->id,        "Acid S&OP");
+    trace_set_name(miner->id,   "Mine");
+    trace_set_name(truck->id,   "Haul truck");
+    trace_set_name(crusher->id, "Crusher");
+    trace_set_name(belt->id,    "Belt conveyor");
+    trace_set_name(flot->id,    "Flotation");
+    trace_set_name(dam->id,     "Tailings dam");
+    trace_set_name(chem->id,    "Acid supplier");
+    trace_set_name(chem_sc->id, "Acid S&OP");
+    trace_set_name(digest->id,  "Acid digest");
+    trace_set_name(pond->id,    "Residue pond");
     trace_open(argc > 1 ? argv[1] : "trace.bin.gz");
 
     i64 next_report = 30 * DAY;
@@ -1106,7 +1309,6 @@ int main(int argc, char** argv) {
         trace_tick(ticked_mask);
 
 
-
         if (g_w.time >= next_report) {
             next_report += 30 * DAY;
             std::cout << "day " << g_w.time / DAY
@@ -1115,6 +1317,9 @@ int main(int argc, char** argv) {
                       << "  belt "   << [belt]{ double s = 0; for (int i = 0; i < BELT_CELLS; i++) s += belt->belt[i].tons(); return s; }()
                       << "  flot "   << flot->mass.tons() << "/" << flot->out.tons()
                       << "  dam "    << dam->mass.tons()
+                      << "  dig "    << digest->wip.tons() << "/" << digest->out.tons()
+                      << "  pond "   << pond->mass.tons()
+                      << "  acid "   << chem->chem_mass.tons() << "t " << chem->chem_cars << "c"
                       << "  add "    << g_additives.tons()
                       << "\n";
         }
