@@ -249,6 +249,7 @@ class C_World {
 
         // Chemical disruption
         i64 chem_disrupted_until = -1;
+        double chem_burned = 0;
 
         // Single global RNG
         std::mt19937_64 rng;
@@ -402,8 +403,8 @@ typedef struct T_Node {
     E_Processor_State proc_state = S_NULL;
 
     // N_CHEM_SRC — the acid tonnage itself is the node's T_Mass blob
-    i64    chem_cars   = 0; // cars per delivery string (set by the scrum)
-    double chem_burned = 0; // consumed
+    i64 chem_cars = 0; // cars per delivery string (set by the scrum)
+    T_ID owned_chem_scrum = -1; // N_CHEM_MONTHLY_SCRUM 
 
     // N_CHEM_MONTHLY_SCRUM
     double chem_burned_at_scrum = 0; // chem_burned snapshot at the last scrum
@@ -731,14 +732,14 @@ static b32 enact_transaction(T_ID id) {
     return true;
 }
 
-T_Node* find_node(E_Node_Type type) {
-    for (int i = 0; i < g_node_count; i++) {
-        if (g_nodes[i].type == type) return &g_nodes[i];
-    }
+// T_Node* find_node(E_Node_Type type) {
+//     for (int i = 0; i < g_node_count; i++) {
+//         if (g_nodes[i].type == type) return &g_nodes[i];
+//     }
 
-    assert(false, "Node of this type not found.");
-    return NULL;
-}
+//     assert(false, "Node of this type not found.");
+//     return NULL;
+// }
 
 // TODO(Sigull): This should have a better abstraction, but don't know what yet.
 void link_nodes(T_Node* from, T_Node* to) {
@@ -807,23 +808,15 @@ T_Node* init_node(E_Node_Type type) {
         n->mass_capacity = CHEM_TANK_CAP;
         n->next_tick = 1 * DAY;
 
-        T_Node* pipe = init_node(N_PIPE);
-        link_chem(n, pipe);    // n->output = pipe, pipe->chem_input = n
-        pipe->input = n->id;  // the pipe pulls from this node's chem_mass
-
         T_Node* scrum = init_node(N_CHEM_MONTHLY_SCRUM);
         scrum->input = n->id; // the scrum reads the supplier's tank + burn
+
+        n->owned_chem_scrum = scrum->id;
 
         init_node(N_CHEM_DISRUPTION); // free-floating clock, writes the global
     }
 
     if (type == N_DIGEST) {
-        // The digest is the pipe's far end: it links itself onto the
-        // supplier's delivery line (built with N_CHEM_SRC). One pipe, one
-        // digest — link_chem asserts if either end is taken.
-        T_Node* pipe = find_node(N_PIPE);
-        link_chem(pipe, n);
-
         n->mass_capacity = DIGEST_MAX_PLS;
         n->next_tick = 1 * DAY;
     }
@@ -933,14 +926,14 @@ void tick(T_ID id) {
             T_Node* src = get_node(n->input);
 
             double window = std::max(1.0, (double)(g_w.time - n->chem_last_scrum));
-            double burn = (src->chem_burned - n->chem_burned_at_scrum) * DAY / window;
+            double burn = (g_w.chem_burned - n->chem_burned_at_scrum) * DAY / window;
             double want = burn + (CHEM_TARGET - src->chem_mass.chem) / CHEM_CATCHUP_DAYS;
 
             i64 cars = (i64)std::llround(want * ((double)CHEM_DELIVERY_PERIOD / DAY) / CHEM_LOT_TONS);
             i64 lo   = (want > 0.0) ? 1 : 0; // a live contract ships at least one car
             src->chem_cars = std::clamp(cars, lo, CHEM_MAX_CARS);
 
-            n->chem_burned_at_scrum = src->chem_burned;
+            n->chem_burned_at_scrum = g_w.chem_burned;
             n->chem_last_scrum = g_w.time;
             n->next_tick = g_w.time + CHEM_SCRUM_PERIOD;
         } break;
@@ -1003,7 +996,7 @@ void tick(T_ID id) {
                     n->chem_mass.chem -= a * tons;
                     // The burn bookkeeping lives on the supplier — that is
                     // what the scrum reads for its trailing-burn term.
-                    find_node(N_CHEM_SRC)->chem_burned += a * tons;
+                    g_w.chem_burned += a * tons;
 
                     double rate = g_w.triangular(DIGEST_RATE_MIN, DIGEST_RATE_MID, DIGEST_RATE_MAX);
                     n->proc_state = S_FINISH;
@@ -1257,10 +1250,10 @@ i64 get_closest_node_tick() {
 
 int main(int argc, char** argv) {
     // miner -> truck ─> crusher -> belt ─> flotation -> rejects ─> dam
-    T_Node* miner   = init_node(N_MINER);
+    T_Node* miner = init_node(N_MINER);
     // Creating the supplier builds the whole chem subsystem — the delivery
     // pipe, the S&OP scrum and the disruption clock (see init_node).
-    T_Node* chem    = init_node(N_CHEM_SRC);
+    T_Node* chem  = init_node(N_CHEM_SRC);
 
     T_Node* truck   = init_node(N_TRUCK);
     T_Node* crusher = init_node(N_CRUSHER);
@@ -1268,9 +1261,10 @@ int main(int argc, char** argv) {
     T_Node* flot    = init_node(N_FLOTATION);
     T_Node* dam     = init_node(N_TAILINGS);
 
-    T_Node* belt1   = init_node(N_CONVEYOR); 
-    T_Node* digest  = init_node(N_DIGEST); // links itself onto the chem pipe
-    T_Node* pond    = init_node(N_TAILINGS);
+    T_Node* belt1  = init_node(N_CONVEYOR); 
+    T_Node* pipe   = init_node(N_PIPE); 
+    T_Node* digest = init_node(N_DIGEST); // links itself onto the chem pipe
+    T_Node* pond   = init_node(N_TAILINGS);
 
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
@@ -1280,6 +1274,9 @@ int main(int argc, char** argv) {
     link_nodes(flot, belt1);
     link_nodes(belt1, digest);
 
+    link_chem(chem, pipe);
+    link_chem(pipe, digest);
+
     link_waste(digest, pond);
 
     link_nodes(miner,   truck);
@@ -1288,17 +1285,17 @@ int main(int argc, char** argv) {
     link_nodes(belt,    flot);
 
     // Trace every tick for the viewer app ("-" disables, see sim_trace.h).
-    trace_set_name(miner->id,   "Mine");
-    trace_set_name(truck->id,   "Haul truck");
-    trace_set_name(crusher->id, "Crusher");
-    trace_set_name(belt->id,    "Belt conveyor");
-    trace_set_name(flot->id,    "Flotation");
-    trace_set_name(dam->id,     "Tailings dam");
-    trace_set_name(chem->id,    "Acid supplier");
-    trace_set_name(find_node(N_CHEM_MONTHLY_SCRUM)->id, "Acid S&OP");
-    trace_set_name(find_node(N_PIPE)->id,                "Acid pipe");
-    trace_set_name(digest->id,  "Acid digest");
-    trace_set_name(pond->id,    "Residue pond");
+    trace_set_name(miner->id,              "Mine");
+    trace_set_name(truck->id,              "Haul truck");
+    trace_set_name(crusher->id,            "Crusher");
+    trace_set_name(belt->id,               "Belt conveyor");
+    trace_set_name(flot->id,               "Flotation");
+    trace_set_name(dam->id,                "Tailings dam");
+    trace_set_name(chem->id,               "Acid supplier");
+    trace_set_name(chem->owned_chem_scrum, "Acid S&OP");
+    trace_set_name(pipe->id,               "Acid pipe");
+    trace_set_name(digest->id,             "Acid digest");
+    trace_set_name(pond->id,               "Residue pond");
     trace_open(argc > 1 ? argv[1] : "trace.bin.gz");
 
     i64 next_report = 30 * DAY;
