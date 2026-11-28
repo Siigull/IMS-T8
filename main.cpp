@@ -642,8 +642,8 @@ static b32 enact_transaction(T_ID id) {
         dst->chem += moved;
         src->chem -= moved;
 
-    } else if(t->mass_dst || t->mass_src || t->dst || t->amt) {
-        debug_assert(false, "Uninitialized enact Move");
+    } else if(t->chem_mass_dst || t->chem_mass_src || t->chem_dst || t->chem_amt) {
+        debug_assert(false, "Uninitialized enact Move (chem)");
     }
 
     // INCREMENT CONVEYOR HEAD. 
@@ -740,6 +740,31 @@ T_Node* find_node(E_Node_Type type) {
     return NULL;
 }
 
+// TODO(Sigull): This should have a better abstraction, but don't know what yet.
+void link_nodes(T_Node* from, T_Node* to) {
+    assert(from->output == -1, "From output already linked.");
+    assert(to->input    == -1, "To input already linked.");
+
+    from->output = to->id;
+    to->input    = from->id;
+}
+
+void link_waste(T_Node* from, T_Node* to) {
+    assert(from->waste_output == -1, "Waste from output already linked.");
+    assert(to->input    == -1, "Waste to input already linked.");
+
+    from->waste_output = to->id;
+    to->input          = from->id;
+}
+
+void link_chem(T_Node* from, T_Node* to) {
+    assert(from->output   == -1, "Chem from output already set.");
+    assert(to->chem_input == -1, "Chem to input already linked.");
+
+    from->output   = to->id;
+    to->chem_input = from->id;
+}
+
 T_Node* init_node(E_Node_Type type) {
     assert(g_node_count < MAX_NODE_COUNT, "Too many nodes. Increase MAX_NODE_COUNT.");
 
@@ -771,12 +796,34 @@ T_Node* init_node(E_Node_Type type) {
         n->proc_state = S_IDLE;
     }
 
+    // The chem SUBSYSTEM constructor: creating the supplier builds its
+    // whole chain — the delivery pipe, the S&OP scrum and the market
+    // disruption clock — wired statically right here. The supplier's output
+    // goes to the pipe; the scrum reads the supplier directly, so it must
+    // NOT go through link_nodes (that would need the output again). The
+    // pipe's far end dangles until a digest links itself onto it (see
+    // N_DIGEST) — until then the pipe idles.
     if (type == N_CHEM_SRC) {
         n->mass_capacity = CHEM_TANK_CAP;
         n->next_tick = 1 * DAY;
+
+        T_Node* pipe = init_node(N_PIPE);
+        link_chem(n, pipe);    // n->output = pipe, pipe->chem_input = n
+        pipe->input = n->id;  // the pipe pulls from this node's chem_mass
+
+        T_Node* scrum = init_node(N_CHEM_MONTHLY_SCRUM);
+        scrum->input = n->id; // the scrum reads the supplier's tank + burn
+
+        init_node(N_CHEM_DISRUPTION); // free-floating clock, writes the global
     }
 
     if (type == N_DIGEST) {
+        // The digest is the pipe's far end: it links itself onto the
+        // supplier's delivery line (built with N_CHEM_SRC). One pipe, one
+        // digest — link_chem asserts if either end is taken.
+        T_Node* pipe = find_node(N_PIPE);
+        link_chem(pipe, n);
+
         n->mass_capacity = DIGEST_MAX_PLS;
         n->next_tick = 1 * DAY;
     }
@@ -831,31 +878,6 @@ T_Node* get_node(i64 id) {
     assert(id < g_node_count && id >= 0, "Code problem. Send ID out of range.");
 
     return &g_nodes[id];
-}
-
-// TODO(Sigull): This should have a better abstraction, but don't know what yet.
-void link_nodes(T_Node* from, T_Node* to) {
-    assert(from->output == -1, "From output already linked.");
-    assert(to->input    == -1, "To input already linked.");
-
-    from->output = to->id;
-    to->input    = from->id;
-}
-
-void link_waste(T_Node* from, T_Node* to) {
-    assert(from->waste_output == -1, "Waste from output already linked.");
-    assert(to->input    == -1, "Waste to input already linked.");
-
-    from->waste_output = to->id;
-    to->input          = from->id;
-}
-
-void link_chem(T_Node* from, T_Node* to) {
-    assert(from->output   == -1, "Chem from output already set.");
-    assert(to->chem_input == -1, "Chem to input already linked.");
-
-    from->output   = to->id;
-    to->chem_input = from->id;
 }
 
 void tick(T_ID id) {
@@ -979,7 +1001,9 @@ void tick(T_ID id) {
                 if (feed >= DIGEST_MIN_CAMPAIGN && tons >= DIGEST_MIN_CAMPAIGN) {
                     inner_node_mass_move(n, &n->mass, &n->wip);
                     n->chem_mass.chem -= a * tons;
-                    n->chem_burned    += a * tons;
+                    // The burn bookkeeping lives on the supplier — that is
+                    // what the scrum reads for its trailing-burn term.
+                    find_node(N_CHEM_SRC)->chem_burned += a * tons;
 
                     double rate = g_w.triangular(DIGEST_RATE_MIN, DIGEST_RATE_MID, DIGEST_RATE_MAX);
                     n->proc_state = S_FINISH;
@@ -1121,6 +1145,11 @@ void tick(T_ID id) {
 b32 transfer(T_ID id) {
     T_Node* n = get_node(id);
 
+    // The chem pipe is built eagerly with its supplier and only gets its far
+    // end when a digest links itself onto it — until then there is nobody to
+    // feed and the pipe idles.
+    if (n->type == N_PIPE && n->output == -1) return true;
+
     assert(n->output != -1, "Mistake in initing g_send_nodes.");
     T_Node* dst = get_node(n->output);
     T_Node* src = get_node(n->input);
@@ -1229,9 +1258,9 @@ i64 get_closest_node_tick() {
 int main(int argc, char** argv) {
     // miner -> truck ─> crusher -> belt ─> flotation -> rejects ─> dam
     T_Node* miner   = init_node(N_MINER);
-    init_node(N_CHEM_DISRUPTION); // Is kind of a global node.
+    // Creating the supplier builds the whole chem subsystem — the delivery
+    // pipe, the S&OP scrum and the disruption clock (see init_node).
     T_Node* chem    = init_node(N_CHEM_SRC);
-    T_Node* chem_sc = init_node(N_CHEM_MONTHLY_SCRUM);
 
     T_Node* truck   = init_node(N_TRUCK);
     T_Node* crusher = init_node(N_CRUSHER);
@@ -1239,9 +1268,8 @@ int main(int argc, char** argv) {
     T_Node* flot    = init_node(N_FLOTATION);
     T_Node* dam     = init_node(N_TAILINGS);
 
-    T_Node* pipe    = init_node(N_PIPE);
     T_Node* belt1   = init_node(N_CONVEYOR); 
-    T_Node* digest  = init_node(N_DIGEST);
+    T_Node* digest  = init_node(N_DIGEST); // links itself onto the chem pipe
     T_Node* pond    = init_node(N_TAILINGS);
 
     // The additive source stays unbuilt/unscheduled for now: its step case
@@ -1252,16 +1280,12 @@ int main(int argc, char** argv) {
     link_nodes(flot, belt1);
     link_nodes(belt1, digest);
 
-    link_chem(chem, pipe);
-    link_chem(pipe, digest);
-
     link_waste(digest, pond);
 
     link_nodes(miner,   truck);
     link_nodes(truck,   crusher);
     link_nodes(crusher, belt);
     link_nodes(belt,    flot);
-    link_nodes(chem,    chem_sc);
 
     // Trace every tick for the viewer app ("-" disables, see sim_trace.h).
     trace_set_name(miner->id,   "Mine");
@@ -1271,7 +1295,8 @@ int main(int argc, char** argv) {
     trace_set_name(flot->id,    "Flotation");
     trace_set_name(dam->id,     "Tailings dam");
     trace_set_name(chem->id,    "Acid supplier");
-    trace_set_name(chem_sc->id, "Acid S&OP");
+    trace_set_name(find_node(N_CHEM_MONTHLY_SCRUM)->id, "Acid S&OP");
+    trace_set_name(find_node(N_PIPE)->id,                "Acid pipe");
     trace_set_name(digest->id,  "Acid digest");
     trace_set_name(pond->id,    "Residue pond");
     trace_open(argc > 1 ? argv[1] : "trace.bin.gz");
