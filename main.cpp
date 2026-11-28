@@ -758,12 +758,16 @@ void link_waste(T_Node* from, T_Node* to) {
     to->input          = from->id;
 }
 
-void link_chem(T_Node* from, T_Node* to) {
+void link_chems(T_Node* from, T_Node* to) {
     assert(from->output   == -1, "Chem from output already set.");
     assert(to->chem_input == -1, "Chem to input already linked.");
 
     from->output   = to->id;
     to->chem_input = from->id;
+
+    if (to->type == N_PIPE) {
+        to->input = from->id;
+    }
 }
 
 T_Node* init_node(E_Node_Type type) {
@@ -828,27 +832,17 @@ T_Node* init_node(E_Node_Type type) {
     return n;
 }
 
-static void inner_node_mass_move(T_Node* n, T_Mass* src, T_Mass* dst) {
+static void inner_node_mass_move(T_Node* n, T_Mass* src, T_Mass* dst, double max_amt) {
     assert(((size_t)src - (size_t)n) < sizeof(T_Node), "Supposedly inner src mass not inside of node.");
     assert(((size_t)dst - (size_t)n) < sizeof(T_Node), "Supposedly inner dst mass not inside of node.");
     
-    for (int el = 0; el < N_ELEMS; el++) {
-        dst->elem[el] += src->elem[el];
-        src->elem[el] = 0;
-    }
+    double total     = src->tons();
+    double dst_space = dst->max_tons - dst->tons(); 
+    if (max_amt > total)     max_amt = total;
+    if (dst_space < max_amt) max_amt = dst_space;
+    if (max_amt <= 0.0)      return;
 
-    dst->waste += src->waste;
-    src->waste = 0;
-}
-
-// Proportional slice of a stock: move `tons` from src into dst, blended by
-// src's composition (the same math enact_transaction applies to T_MOVE).
-static void mass_move_amount(T_Mass* src, T_Mass* dst, double tons) {
-    double total = src->tons();
-    if (tons > total) tons = total;
-    if (tons <= 0.0) return;
-
-    double frac = tons / total;
+    double frac = max_amt / total;
     for (int el = 0; el < N_ELEMS; el++) {
         double moved = src->elem[el] * frac;
         dst->elem[el] += moved;
@@ -978,7 +972,7 @@ void tick(T_ID id) {
                     pond->mass.waste += n->wip.waste;
                     n->wip.waste = 0;
 
-                    inner_node_mass_move(n, &n->wip, &n->out);
+                    inner_node_mass_move(n, &n->wip, &n->out, HUGE_VAL);
 
                     n->proc_state = S_IDLE;
                     n->next_tick = g_w.time + 5 * MIN;
@@ -992,7 +986,7 @@ void tick(T_ID id) {
 
                 // Proceed to batch and digest.
                 if (feed >= DIGEST_MIN_CAMPAIGN && tons >= DIGEST_MIN_CAMPAIGN) {
-                    inner_node_mass_move(n, &n->mass, &n->wip);
+                    inner_node_mass_move(n, &n->mass, &n->wip, tons);
                     n->chem_mass.chem -= a * tons;
                     // The burn bookkeeping lives on the supplier — that is
                     // what the scrum reads for its trailing-burn term.
@@ -1031,7 +1025,7 @@ void tick(T_ID id) {
         {
             if (n->proc_state == S_FINISH) {
                 if (n->out.tons() + n->wip.tons() < n->mass_capacity) {
-                    inner_node_mass_move(n, &n->wip, &n->out);
+                    inner_node_mass_move(n, &n->wip, &n->out, HUGE_VAL);
 
                     n->proc_state = S_IDLE;
                     n->next_tick = g_w.time + 5 * MIN;
@@ -1041,7 +1035,7 @@ void tick(T_ID id) {
                 double tons = n->mass.tons();
                 if (tons > 0.0) {
                     double rate = g_w.uniform(CRUSHER_MIN_RATE, CRUSHER_MAX_RATE);
-                    inner_node_mass_move(n, &n->mass, &n->wip);
+                    inner_node_mass_move(n, &n->mass, &n->wip, HUGE_VAL);
         
                     n->proc_state = S_FINISH;
                     n->next_tick = g_w.time + (i64)std::llround(tons / rate * HOUR);
@@ -1096,7 +1090,7 @@ void tick(T_ID id) {
                 dam->mass.waste += n->wip.waste - gangue_to_conc;
                 n->wip.waste = gangue_to_conc;
 
-                inner_node_mass_move(n, &n->wip, &n->out);
+                inner_node_mass_move(n, &n->wip, &n->out, HUGE_VAL);
 
                 // TODO(Sigull): How long does this take irl.
                 n->proc_state = S_IDLE;
@@ -1115,7 +1109,7 @@ void tick(T_ID id) {
                                             FLOTATION_MID_CAPACITY,
                                             FLOTATION_MAX_CAPACITY);
 
-                inner_node_mass_move(n, &n->mass, &n->wip);
+                inner_node_mass_move(n, &n->mass, &n->wip, HUGE_VAL);
                 n->proc_state = S_FINISH;
                 n->next_tick = g_w.time + (i64)((tons / cap) * HOUR);
 
@@ -1265,6 +1259,9 @@ int main(int argc, char** argv) {
     T_Node* pipe   = init_node(N_PIPE); 
     T_Node* digest = init_node(N_DIGEST); // links itself onto the chem pipe
     T_Node* pond   = init_node(N_TAILINGS);
+    
+    T_Node* temp_belt2 = init_node(N_CONVEYOR);
+    T_Node* temp_digest_out = init_node(N_TAILINGS);
 
     // The additive source stays unbuilt/unscheduled for now: its step case
     // exists, but nothing consumes g_additives yet.
@@ -1274,10 +1271,13 @@ int main(int argc, char** argv) {
     link_nodes(flot, belt1);
     link_nodes(belt1, digest);
 
-    link_chem(chem, pipe);
-    link_chem(pipe, digest);
+    link_chems(chem, pipe);
+    link_chems(pipe, digest);
 
     link_waste(digest, pond);
+
+    link_nodes(digest, temp_belt2);
+    link_nodes(temp_belt2, temp_digest_out);
 
     link_nodes(miner,   truck);
     link_nodes(truck,   crusher);

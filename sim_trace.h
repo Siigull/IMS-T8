@@ -204,7 +204,7 @@ static void trace_tick(u64 ticked_mask) {
             cur.conv_state   = (uint8_t)n->conv_state;
             cur.next_tick    = n->next_tick;
             cur.chem_cars    = (int32_t)n->chem_cars;
-            cur.chem_burned  = (float)n->chem_burned;
+            cur.chem_burned  = (float)g_w.chem_burned;
             cur.chem_burned_at_scrum = (float)n->chem_burned_at_scrum;
             cur.chem_last_scrum     = n->chem_last_scrum;
             cur.belt_head    = (int32_t)n->belt_head;
