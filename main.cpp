@@ -526,7 +526,7 @@ void trans_add_move(T_Transaction* t, T_Mass* mass_src, T_Node* src, T_Mass* mas
 }
 
 void trans_add_move_chem(T_Transaction* t, T_Chem_Mass* chem_src, T_Node* src, T_Chem_Mass* chem_dst, T_Node* dst, double amt) {
-    debug_assert(t->type & T_MOVE, "Move 1");
+    debug_assert(t->type & T_MOVE_CHEM, "Chem 1");
     assert(((size_t)chem_src - (size_t)src) < sizeof(T_Node), "add_move: src mass not in src");
     assert(((size_t)chem_dst - (size_t)dst) < sizeof(T_Node), "add_move: dst mass not in dst");
 
@@ -535,7 +535,7 @@ void trans_add_move_chem(T_Transaction* t, T_Chem_Mass* chem_src, T_Node* src, T
     t->chem_src = src;
     t->chem_dst = dst;
 
-    t->amt = amt;
+    t->chem_amt = amt;
 }
 
 void trans_add_head(T_Transaction* t, T_Node* conveyor) {
@@ -650,8 +650,19 @@ static b32 enact_transaction(T_ID id) {
     if(t->type & T_HEAD_INCREMENT) {
         T_Node* c = t->conveyor;
         i64 head = c->belt_head % c->belt_size;
+        double head_value = HUGE_VAL;
+        if (c->type == N_CONVEYOR) {
+            head_value = c->belt[head].tons();
+        
+        } else if (c->type == N_PIPE) {
+            head_value = c->belt_chem[head].tons();
+        
+        } else {
+            assert(false, "Head increment.");
+        }
 
-        if (c->belt[head].tons() <= 0.0) {
+
+        if (head_value <= 0.0) {
             c->belt_head++;
         } else {
             return false;
@@ -693,15 +704,15 @@ static b32 enact_transaction(T_ID id) {
     // WAKE UP SRC AND DST OF MOVE IF THEY ARE ASLEEP.
     // Kind of a hack. Wake up floation tank when move and tank is idle.
     // Reference comment in N_FLOATION in tick().
-    if (t->type & T_MOVE) {
-        T_Node* dst = t->dst;
-        T_Node* src = t->src;
+    if (t->type & T_MOVE || t->type & T_MOVE_CHEM) {
+        T_Node* dst = t->type & T_MOVE ? t->dst : t->chem_dst;
+        T_Node* src = t->type & T_MOVE ? t->src : t->chem_src;
         
         // DST
         // proc_state only on nodes, which can be woken up.
         bool proc_state_idle = dst->proc_state == S_IDLE;
         bool is_tick_in_past = dst->next_tick < g_w.time;
-        bool not_transfer = dst->type != N_TRUCK && dst->type != N_CONVEYOR;
+        bool not_transfer = dst->type != N_TRUCK && dst->type != N_CONVEYOR && dst->type != N_PIPE;
 
         if (proc_state_idle && is_tick_in_past && not_transfer) {
             dst->next_tick = g_w.time + 5 * MIN;
@@ -709,7 +720,7 @@ static b32 enact_transaction(T_ID id) {
 
         // SRC
         is_tick_in_past = src->next_tick < g_w.time;
-        not_transfer = src->type != N_TRUCK && src->type != N_CONVEYOR;
+        not_transfer = src->type != N_TRUCK && src->type != N_CONVEYOR && src->type != N_PIPE;
 
         if (is_tick_in_past && not_transfer) {
             src->next_tick = g_w.time + 5 * MIN;
@@ -720,6 +731,14 @@ static b32 enact_transaction(T_ID id) {
     return true;
 }
 
+T_Node* find_node(E_Node_Type type) {
+    for (int i = 0; i < g_node_count; i++) {
+        if (g_nodes[i].type == type) return &g_nodes[i];
+    }
+
+    assert(false, "Node of this type not found.");
+    return NULL;
+}
 
 T_Node* init_node(E_Node_Type type) {
     assert(g_node_count < MAX_NODE_COUNT, "Too many nodes. Increase MAX_NODE_COUNT.");
@@ -743,7 +762,7 @@ T_Node* init_node(E_Node_Type type) {
         g_transfer_nodes[g_transfer_node_count++] = n->id;
     }
 
-    if (type == N_CONVEYOR || N_PIPE) {
+    if (type == N_CONVEYOR || type == N_PIPE) {
         n->mass_capacity = BELT_CELL_CAP;
     }
 
@@ -758,10 +777,6 @@ T_Node* init_node(E_Node_Type type) {
     }
 
     if (type == N_DIGEST) {
-        T_Node* chem_src = find_node(N_CHEM_SRC);
-        assert(chem_src != NULL, "Chem src has to be inited before this.");
-
-        n->chem_input = chem_src->id;
         n->mass_capacity = DIGEST_MAX_PLS;
         n->next_tick = 1 * DAY;
     }
@@ -818,16 +833,6 @@ T_Node* get_node(i64 id) {
     return &g_nodes[id];
 }
 
-T_Node* find_node(E_Node_Type type) {
-    for (int i = 0; i < g_node_count; i++) {
-        if (g_nodes[i].type == type) return &g_nodes[i];
-    }
-
-    assert(false, "Node of this type not found.");
-    return NULL;
-}
-
-
 // TODO(Sigull): This should have a better abstraction, but don't know what yet.
 void link_nodes(T_Node* from, T_Node* to) {
     assert(from->output == -1, "From output already linked.");
@@ -838,7 +843,7 @@ void link_nodes(T_Node* from, T_Node* to) {
 }
 
 void link_waste(T_Node* from, T_Node* to) {
-    assert(from->output == -1, "Waste from output already linked.");
+    assert(from->waste_output == -1, "Waste from output already linked.");
     assert(to->input    == -1, "Waste to input already linked.");
 
     from->waste_output = to->id;
@@ -1039,6 +1044,16 @@ void tick(T_ID id) {
         } break;
 
 
+        case N_PIPE:
+        {
+            if (n->conv_state != C_MOVING) {
+                assert(false, "Bad pipe tick");
+            }
+
+            n->conv_state = C_LOADING;
+        } break;
+
+
         // TODO(Sigull): This whole code can't really map to real life.
         //               Also I remember it should have a failure state.
         
@@ -1168,13 +1183,13 @@ b32 transfer(T_ID id) {
                 i64 read_head  = n->belt_head % n->belt_size;
                 T_Transaction* t1;
                 t1 = make_transaction(T_MOVE_CHEM);
-                trans_add_move_chem(t1, &n->belt_chem[read_head], n, &dst->chem_mass, dst, n->belt[read_head].tons());
-    
+                trans_add_move_chem(t1, &n->belt_chem[read_head], n, &dst->chem_mass, dst, n->belt_chem[read_head].tons());
+
                 // Receiving
                 i64 write_head = (n->belt_head - 1) % n->belt_size;
                 T_Transaction* t2 = make_transaction(T_MOVE_CHEM);
                 trans_add_move_chem(t2, &src->chem_mass, src, &n->belt_chem[write_head], n, BELT_CELL_CAP);
-    
+
                 // Increment head
                 T_Transaction* t3 = make_transaction(T_HEAD_INCREMENT | T_STATE | T_TICK);
                 trans_add_head(t3, n); // Takes care of the fact, that it can only increment when at read head 0 tons.
